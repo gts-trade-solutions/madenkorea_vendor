@@ -117,40 +117,9 @@ export default function Home() {
             </div>
 
             {/* Optional illustration */}
-            <div className="mt-5 rounded-xl bg-muted/50 p-4">
-              <div className="flex items-center gap-3">
-                <div className="relative h-10 w-10 overflow-hidden rounded-lg border bg-background">
-                  <Image
-                    src="https://nextjs.org/icons/next.svg"
-                    alt="Icon"
-                    fill
-                    className="object-contain p-2"
-                    priority
-                  />
-                </div>
-                <div>
-                  <div className="text-sm font-medium">Fast & Secure</div>
-                  <div className="text-xs text-muted-foreground">
-                    Built with Next.js + Supabase
-                  </div>
-                </div>
-              </div>
-            </div>
+            
 
-            <div className="mt-5 flex gap-2">
-              <Link
-                href="/vendor"
-                className="inline-flex h-10 flex-1 items-center justify-center rounded-md bg-foreground px-4 text-sm font-medium text-background hover:opacity-90"
-              >
-                Go to /vendor
-              </Link>
-              <Link
-                href="/"
-                className="inline-flex h-10 items-center justify-center rounded-md border bg-background px-4 text-sm font-medium hover:bg-muted"
-              >
-                Customer Site
-              </Link>
-            </div>
+            
           </div>
         </div>
       </main>
