@@ -148,7 +148,7 @@ export default function VendorLoginPage() {
               <Link className="text-primary underline" href="/vendor/register">Register</Link>
             </div>
             <div className="text-xs text-center mt-2">
-              <Link className="text-muted-foreground underline" href="/auth/forgot-password">
+              <Link className="text-muted-foreground underline" href="/vendor/forgot-password">
                 Forgot password?
               </Link>
             </div>

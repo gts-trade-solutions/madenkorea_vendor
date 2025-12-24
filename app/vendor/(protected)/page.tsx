@@ -32,7 +32,16 @@ type VendorInfo = {
   status: "pending" | "approved" | "rejected" | "disabled";
   role: "owner" | "manager" | "staff" | null;
   rejected_reason?: string | null;
-  email?: string | null; // business email if stored on vendors row
+  email?: string | null;
+};
+
+type ExpiringRow = {
+  id: string;
+  name: string;
+  slug: string;
+  expiry_date: string; // YYYY-MM-DD
+  stock_qty: number;
+  days_left: number;
 };
 
 const supabase = createClient(
@@ -41,7 +50,6 @@ const supabase = createClient(
   { auth: { persistSession: true, autoRefreshToken: true } }
 );
 
-// RPC that RETURNS TABLE comes back as an array. Normalize to single object.
 function coerceVendor(data: any): VendorInfo | null {
   const arr = Array.isArray(data) ? data : data ? [data] : [];
   const v = arr[0];
@@ -57,28 +65,63 @@ function coerceVendor(data: any): VendorInfo | null {
   } as VendorInfo;
 }
 
+function toYmd(d: Date) {
+  const x = new Date(d);
+  x.setHours(0, 0, 0, 0);
+  return x.toISOString().slice(0, 10);
+}
+
+function daysLeftFromYmd(ymd: string) {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const exp = new Date(ymd);
+  exp.setHours(0, 0, 0, 0);
+  return Math.round((exp.getTime() - today.getTime()) / 86400000);
+}
+
+function expiryClass(daysLeft: number, alertDays: number) {
+  if (daysLeft < 0) return "bg-red-600 text-white";
+  if (daysLeft <= 30) return "bg-red-500 text-white";
+  if (daysLeft <= 90) return "bg-orange-500 text-white";
+  if (daysLeft <= alertDays) return "bg-yellow-400 text-black";
+  return "bg-muted text-foreground";
+}
+
 export default function VendorDashboard() {
   const router = useRouter();
-  const { user, logout } = useAuth();
+  const { user } = useAuth(); // ✅ only user, no logout
 
-  const [hydrated, setHydrated] = useState(false); // wait for auth session
+  const [hydrated, setHydrated] = useState(false);
   const [loading, setLoading] = useState(true);
   const [vendor, setVendor] = useState<VendorInfo | null>(null);
   const [vendorEmail, setVendorEmail] = useState<string | null>(null);
 
+  const [alertDays, setAlertDays] = useState<number>(180);
+  const [expiring, setExpiring] = useState<ExpiringRow[]>([]);
+  const [productStats, setProductStats] = useState({
+    total: 0,
+    published: 0,
+    lowStock: 0,
+    outOfStock: 0,
+    expiringCount: 0,
+    expiredCount: 0,
+  });
+
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      // Ensure session is hydrated (prevents false "not logged in")
-      const { data: { session } } = await supabase.auth.getSession();
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+
       if (!session?.user) {
         setHydrated(true);
         router.replace("/vendor/login");
         return;
       }
+
       setHydrated(true);
 
-      // Fetch vendor tied to this account
       const { data, error } = await supabase.rpc("get_my_vendor");
       if (cancelled) return;
 
@@ -92,7 +135,6 @@ export default function VendorDashboard() {
       const v = coerceVendor(data);
       setVendor(v);
 
-      // Prefer business email from vendors row; fall back to user email
       if (v?.email) setVendorEmail(v.email);
       else if (v?.id) {
         const { data: vendRow } = await supabase
@@ -116,6 +158,98 @@ export default function VendorDashboard() {
     };
   }, [router]);
 
+  // Load alert window + expiring products + compute stats
+  useEffect(() => {
+    if (!vendor?.id || vendor.status !== "approved") return;
+
+    (async () => {
+      // vendor expiry window
+      const { data: vset } = await supabase
+        .from("vendors")
+        .select("expiry_alert_days")
+        .eq("id", vendor.id)
+        .maybeSingle();
+
+      const d = Number((vset as any)?.expiry_alert_days ?? 180);
+      const windowDays = Number.isFinite(d) && d > 0 ? d : 180;
+      setAlertDays(windowDays);
+
+      // expiring list (ONLY within window)
+      const end = toYmd(new Date(Date.now() + windowDays * 86400000));
+      const { data: prod, error: pErr } = await supabase
+        .from("products")
+        .select("id,name,slug,expiry_date,stock_qty,is_published,track_inventory")
+        .eq("vendor_id", vendor.id)
+        .not("expiry_date", "is", null)
+        .lte("expiry_date", end)
+        .order("expiry_date", { ascending: true })
+        .limit(25);
+
+      if (pErr) {
+        console.error(pErr);
+        setExpiring([]);
+      } else {
+        const list = (prod ?? []).map((p: any) => {
+          const ymd = String(p.expiry_date).slice(0, 10);
+          const dl = daysLeftFromYmd(ymd);
+          return {
+            id: p.id,
+            name: p.name,
+            slug: p.slug,
+            expiry_date: ymd,
+            stock_qty: Number(p.stock_qty ?? 0),
+            days_left: dl,
+          } as ExpiringRow;
+        });
+        setExpiring(list);
+      }
+
+      // product stats
+      const { data: allProd } = await supabase
+        .from("products")
+        .select("id,is_published,track_inventory,stock_qty,expiry_date")
+        .eq("vendor_id", vendor.id);
+
+      const todayYmd = toYmd(new Date());
+      const endYmd = end;
+
+      let total = 0;
+      let published = 0;
+      let lowStock = 0;
+      let outOfStock = 0;
+      let expiringCount = 0;
+      let expiredCount = 0;
+
+      for (const p of (allProd ?? []) as any[]) {
+        total += 1;
+        if (p.is_published) published += 1;
+
+        const tracking = p.track_inventory ?? true;
+        const qty = Number(p.stock_qty ?? 0);
+
+        if (tracking) {
+          if (qty === 0) outOfStock += 1;
+          else if (qty > 0 && qty <= 5) lowStock += 1;
+        }
+
+        const exp = p.expiry_date ? String(p.expiry_date).slice(0, 10) : null;
+        if (exp) {
+          if (exp < todayYmd) expiredCount += 1;
+          else if (exp >= todayYmd && exp <= endYmd) expiringCount += 1;
+        }
+      }
+
+      setProductStats({
+        total,
+        published,
+        lowStock,
+        outOfStock,
+        expiringCount,
+        expiredCount,
+      });
+    })();
+  }, [vendor?.id, vendor?.status]);
+
   const statusBadge = (s?: VendorInfo["status"]) => {
     if (s === "approved") return <Badge>Approved</Badge>;
     if (s === "pending") return <Badge variant="secondary">Pending</Badge>;
@@ -124,13 +258,17 @@ export default function VendorDashboard() {
     return null;
   };
 
+  // ✅ FIXED LOGOUT
   const handleLogout = async () => {
-    await logout();
+    const { error } = await supabase.auth.signOut();
+    if (error) {
+      toast.error(error.message || "Logout failed");
+      return;
+    }
     toast.success("Logged out successfully");
     router.push("/");
   };
 
-  // ====== Loading / hydration
   if (!hydrated || loading) {
     return (
       <div className="container mx-auto py-16 text-muted-foreground">
@@ -139,7 +277,6 @@ export default function VendorDashboard() {
     );
   }
 
-  // ====== No vendor yet → prompt to register
   if (!vendor) {
     return (
       <div className="flex min-h-screen items-center justify-center p-4">
@@ -151,10 +288,7 @@ export default function VendorDashboard() {
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
-            <Button
-              className="w-full"
-              onClick={() => router.push("/vendor/register")}
-            >
+            <Button className="w-full" onClick={() => router.push("/vendor/register")}>
               Create Vendor Account
             </Button>
             <div className="text-xs text-muted-foreground text-center">
@@ -170,7 +304,6 @@ export default function VendorDashboard() {
     );
   }
 
-  // ====== Pending → show friendly wait screen
   if (vendor.status === "pending") {
     return (
       <div className="flex min-h-screen items-center justify-center p-4">
@@ -179,8 +312,7 @@ export default function VendorDashboard() {
             <Hourglass className="h-10 w-10 mx-auto text-amber-500 mb-2" />
             <CardTitle className="text-2xl">Application in Review</CardTitle>
             <CardDescription>
-              Thanks, <b>{vendor.display_name}</b>. We’ll notify you once
-              approved.
+              Thanks, <b>{vendor.display_name}</b>. We’ll notify you once approved.
             </CardDescription>
           </CardHeader>
           <CardContent>
@@ -193,7 +325,6 @@ export default function VendorDashboard() {
     );
   }
 
-  // ====== Rejected / Disabled
   if (vendor.status === "rejected" || vendor.status === "disabled") {
     return (
       <div className="flex min-h-screen items-center justify-center p-4">
@@ -201,9 +332,7 @@ export default function VendorDashboard() {
           <CardHeader>
             <ShieldAlert className="h-10 w-10 mx-auto text-red-500 mb-2" />
             <CardTitle className="text-2xl">
-              {vendor.status === "rejected"
-                ? "Application Rejected"
-                : "Account Disabled"}
+              {vendor.status === "rejected" ? "Application Rejected" : "Account Disabled"}
             </CardTitle>
             <CardDescription>
               {vendor.rejected_reason
@@ -224,10 +353,8 @@ export default function VendorDashboard() {
     );
   }
 
-  // ====== Approved → Dashboard
   return (
     <div className="min-h-screen bg-muted/30">
-      {/* Header */}
       <header className="border-b bg-background">
         <div className="container mx-auto py-4 flex justify-between items-center">
           <div className="flex items-center gap-3">
@@ -237,10 +364,7 @@ export default function VendorDashboard() {
           <div className="flex items-center gap-4">
             <span className="text-sm text-muted-foreground">
               {vendor.display_name}
-              {/* Prefer vendor business email, fallback to auth email */}
-              {(vendorEmail || user?.email) ? (
-                <> · {vendorEmail ?? user?.email}</>
-              ) : null}
+              {(vendorEmail || user?.email) ? <> · {vendorEmail ?? user?.email}</> : null}
             </span>
             <Button variant="outline" size="sm" onClick={handleLogout}>
               <LogOut className="mr-2 h-4 w-4" />
@@ -250,39 +374,26 @@ export default function VendorDashboard() {
         </div>
       </header>
 
-      {/* Content */}
-      <div className="container mx-auto py-8">
-        <div className="mb-8">
+      <div className="container mx-auto py-8 space-y-8">
+        <div>
           <h2 className="text-3xl font-bold mb-2">Dashboard</h2>
           <p className="text-muted-foreground">
-            Manage your catalog, orders, and payouts
+            Expiry window: <b>{alertDays}</b> days
           </p>
         </div>
 
-        {/* Summary cards (placeholders for now) */}
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
+        {/* Summary cards */}
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
           <Card>
             <CardHeader className="pb-3">
               <CardTitle className="text-sm font-medium text-muted-foreground">
-                Total Sales
+                Products (Total)
               </CardTitle>
             </CardHeader>
             <CardContent>
-              <div className="text-3xl font-bold">₹—</div>
-              <p className="text-xs text-muted-foreground mt-1">Coming soon</p>
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardHeader className="pb-3">
-              <CardTitle className="text-sm font-medium text-muted-foreground">
-                Orders
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="text-3xl font-bold">—</div>
+              <div className="text-3xl font-bold">{productStats.total}</div>
               <p className="text-xs text-muted-foreground mt-1">
-                Pending fulfillment
+                Published: {productStats.published}
               </p>
             </CardContent>
           </Card>
@@ -290,13 +401,15 @@ export default function VendorDashboard() {
           <Card>
             <CardHeader className="pb-3">
               <CardTitle className="text-sm font-medium text-muted-foreground">
-                Products
+                Stock Alerts
               </CardTitle>
             </CardHeader>
             <CardContent>
-              <div className="text-3xl font-bold">—</div>
+              <div className="text-3xl font-bold">
+                {productStats.outOfStock + productStats.lowStock}
+              </div>
               <p className="text-xs text-muted-foreground mt-1">
-                Active products
+                Out: {productStats.outOfStock} • Low: {productStats.lowStock}
               </p>
             </CardContent>
           </Card>
@@ -304,15 +417,83 @@ export default function VendorDashboard() {
           <Card>
             <CardHeader className="pb-3">
               <CardTitle className="text-sm font-medium text-muted-foreground">
-                Payouts
+                Expiring Soon
               </CardTitle>
             </CardHeader>
             <CardContent>
-              <div className="text-3xl font-bold">₹—</div>
-              <p className="text-xs text-muted-foreground mt-1">Next payout</p>
+              <div className="text-3xl font-bold">{productStats.expiringCount}</div>
+              <p className="text-xs text-muted-foreground mt-1">
+                Within {alertDays} days
+              </p>
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader className="pb-3">
+              <CardTitle className="text-sm font-medium text-muted-foreground">
+                Expired
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="text-3xl font-bold">{productStats.expiredCount}</div>
+              <p className="text-xs text-muted-foreground mt-1">
+                Already expired
+              </p>
             </CardContent>
           </Card>
         </div>
+
+        {/* Expiry list */}
+        <Card>
+          <CardHeader>
+            <CardTitle>Expiry Alerts</CardTitle>
+            <CardDescription>
+              Products expiring within the next {alertDays} days (includes already expired).
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-2">
+            {expiring.length === 0 ? (
+              <div className="text-sm text-muted-foreground">
+                No products expiring within the alert window.
+              </div>
+            ) : (
+              expiring.map((p) => (
+                <div
+                  key={p.id}
+                  className="flex items-center justify-between border rounded-md p-3"
+                >
+                  <div>
+                    <div className="font-medium">{p.name}</div>
+                    <div className="text-xs text-muted-foreground">
+                      Expiry: {p.expiry_date} • Stock: {p.stock_qty}
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    <span
+                      className={`text-xs px-2 py-1 rounded ${expiryClass(
+                        p.days_left,
+                        alertDays
+                      )}`}
+                    >
+                      {p.days_left < 0
+                        ? `${Math.abs(p.days_left)}d expired`
+                        : `${p.days_left}d left`}
+                    </span>
+
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() => router.push(`/vendor/products/${p.id}`)}
+                    >
+                      Open
+                    </Button>
+                  </div>
+                </div>
+              ))
+            )}
+          </CardContent>
+        </Card>
 
         {/* Quick actions */}
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
@@ -379,12 +560,12 @@ export default function VendorDashboard() {
           <Card className="hover:shadow-lg transition-shadow">
             <CardHeader>
               <AlertTriangle className="h-8 w-8 mb-2 text-primary" />
-              <CardTitle>Low Stock Alerts</CardTitle>
-              <CardDescription>Monitor inventory levels</CardDescription>
+              <CardTitle>Alerts</CardTitle>
+              <CardDescription>Monitor inventory and expiry</CardDescription>
             </CardHeader>
             <CardContent>
               <p className="text-sm text-muted-foreground mb-4">
-                Get notified when products are running low on stock.
+                View low stock, out of stock, and expiry alerts.
               </p>
               <Button
                 variant="outline"

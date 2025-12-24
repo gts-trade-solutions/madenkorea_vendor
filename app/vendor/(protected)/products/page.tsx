@@ -41,8 +41,11 @@ type ProductRow = {
   updated_at: string;
   vendor_id: string | null;
   brands?: { name?: string | null } | null;
+
   track_inventory?: boolean | null;
   stock_qty?: number | null;
+
+  expiry_date?: string | null; // date
 };
 
 const supabase = createClient(
@@ -51,7 +54,6 @@ const supabase = createClient(
   { auth: { persistSession: true, autoRefreshToken: true } }
 );
 
-// ---- helpers
 function coerceVendor(data: any): VendorInfo | null {
   const arr = Array.isArray(data) ? data : data ? [data] : [];
   const v = arr[0];
@@ -73,10 +75,30 @@ function formatINR(v?: number | null, currency?: string | null) {
   }
 }
 
-function useDebouncedCallback<T extends (...args: any[]) => void>(
-  fn: T,
-  delay = 500
-) {
+function toYmd(d: Date) {
+  const x = new Date(d);
+  x.setHours(0, 0, 0, 0);
+  return x.toISOString().slice(0, 10);
+}
+
+function daysLeftFromYmd(ymd?: string | null) {
+  if (!ymd) return null;
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const exp = new Date(ymd);
+  exp.setHours(0, 0, 0, 0);
+  return Math.round((exp.getTime() - today.getTime()) / 86400000);
+}
+
+function expiryPillClass(daysLeft: number, alertDays: number) {
+  if (daysLeft < 0) return "bg-red-600 text-white";
+  if (daysLeft <= 30) return "bg-red-500 text-white";
+  if (daysLeft <= 90) return "bg-orange-500 text-white";
+  if (daysLeft <= alertDays) return "bg-yellow-400 text-black";
+  return "bg-muted text-foreground";
+}
+
+function useDebouncedCallback<T extends (...args: any[]) => void>(fn: T, delay = 500) {
   const fnRef = useRef(fn);
   useEffect(() => {
     fnRef.current = fn;
@@ -91,23 +113,22 @@ function useDebouncedCallback<T extends (...args: any[]) => void>(
 export default function VendorProductsPage() {
   const router = useRouter();
 
-  const [hydrated, setHydrated] = useState(false); // wait for session restore
-  const [ready, setReady] = useState(false); // gate UI after vendor check
+  const [hydrated, setHydrated] = useState(false);
+  const [ready, setReady] = useState(false);
   const [vendor, setVendor] = useState<VendorInfo | null>(null);
 
   const [search, setSearch] = useState("");
   const [rows, setRows] = useState<ProductRow[]>([]);
   const [loading, setLoading] = useState(true);
-  const [paging, setPaging] = useState({ from: 0, to: 19, more: false }); // 20/page
+  const [paging, setPaging] = useState({ from: 0, to: 19, more: false });
   const [refreshKey, setRefreshKey] = useState(0);
 
-  // 1) Hydrate auth + vendor check (fixes bouncing)
+  const [alertDays, setAlertDays] = useState<number>(180);
+
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      const {
-        data: { session },
-      } = await supabase.auth.getSession();
+      const { data: { session } } = await supabase.auth.getSession();
       if (!session?.user) {
         setHydrated(true);
         router.replace("/vendor/login");
@@ -120,7 +141,7 @@ export default function VendorProductsPage() {
 
       if (error) {
         console.error("get_my_vendor error", error);
-        router.replace("/vendor"); // VendorGate will render state
+        router.replace("/vendor");
         return;
       }
 
@@ -139,7 +160,6 @@ export default function VendorProductsPage() {
     })();
 
     const { data: sub } = supabase.auth.onAuthStateChange(() => {
-      // session changes will trigger on next mount/navigation anyway
       setHydrated(true);
     });
 
@@ -149,10 +169,24 @@ export default function VendorProductsPage() {
     };
   }, [router]);
 
-  // 2) Fetch vendor products (paged)
+  // load vendor expiry_alert_days
+  useEffect(() => {
+    if (!vendor?.id) return;
+    (async () => {
+      const { data } = await supabase
+        .from("vendors")
+        .select("expiry_alert_days")
+        .eq("id", vendor.id)
+        .maybeSingle();
+      const d = Number((data as any)?.expiry_alert_days ?? 180);
+      setAlertDays(Number.isFinite(d) && d > 0 ? d : 180);
+    })();
+  }, [vendor?.id]);
+
   const loadPage = async (reset = false) => {
     if (!vendor) return;
     setLoading(true);
+
     const from = reset ? 0 : paging.from;
     const to = reset ? 19 : paging.to;
 
@@ -162,7 +196,8 @@ export default function VendorProductsPage() {
         `
         id, slug, name, price, currency, is_published, updated_at, vendor_id,
         brands ( name ),
-        track_inventory, stock_qty
+        track_inventory, stock_qty,
+        expiry_date
       `
       )
       .eq("vendor_id", vendor.id)
@@ -175,7 +210,7 @@ export default function VendorProductsPage() {
       setPaging({ from: 0, to: 19, more: false });
     } else {
       const got = (data ?? []) as ProductRow[];
-      setRows(reset ? got : from === 0 ? got : [...rows, ...got]);
+      setRows((prev) => (reset ? got : from === 0 ? got : [...prev, ...got]));
       const more = got.length >= to - from + 1;
       setPaging({
         from: reset ? 20 : to + 1,
@@ -183,6 +218,7 @@ export default function VendorProductsPage() {
         more,
       });
     }
+
     setLoading(false);
   };
 
@@ -192,7 +228,6 @@ export default function VendorProductsPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ready, vendor, refreshKey]);
 
-  // 3) Client search
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
     if (!q) return rows;
@@ -204,7 +239,6 @@ export default function VendorProductsPage() {
     );
   }, [rows, search]);
 
-  // 4) Actions
   const onDelete = async (id: string) => {
     const yes = window.confirm("Delete this product? This cannot be undone.");
     if (!yes) return;
@@ -218,52 +252,79 @@ export default function VendorProductsPage() {
   };
 
   const togglePublish = async (id: string, next: boolean) => {
-    const prev = rows;
-    setRows(rows.map((r) => (r.id === id ? { ...r, is_published: next } : r)));
+    const old = rows.find((r) => r.id === id)?.is_published;
+
+    setRows((prev) =>
+      prev.map((r) => (r.id === id ? { ...r, is_published: next } : r))
+    );
+
     const { error } = await supabase
       .from("products")
       .update({ is_published: next })
       .eq("id", id);
+
     if (error) {
       toast.error(error.message || "Failed to update visibility");
-      setRows(prev);
+      if (typeof old === "boolean") {
+        setRows((prev) =>
+          prev.map((r) => (r.id === id ? { ...r, is_published: old } : r))
+        );
+      } else {
+        setRefreshKey((k) => k + 1);
+      }
     } else {
       toast.success(next ? "Product published" : "Product hidden");
     }
   };
 
   const toggleTrack = async (id: string, next: boolean) => {
-    const prev = rows;
-    setRows(
-      rows.map((r) => (r.id === id ? { ...r, track_inventory: next } : r))
+    const old = rows.find((r) => r.id === id)?.track_inventory ?? true;
+
+    // IMPORTANT: functional update (fixes random disable)
+    setRows((prev) =>
+      prev.map((r) => (r.id === id ? { ...r, track_inventory: next } : r))
     );
+
     const { error } = await supabase
       .from("products")
       .update({ track_inventory: next })
       .eq("id", id);
+
     if (error) {
       toast.error(error.message || "Failed to update inventory tracking");
-      setRows(prev);
+      setRows((prev) =>
+        prev.map((r) => (r.id === id ? { ...r, track_inventory: old } : r))
+      );
     } else {
       toast.success(next ? "Tracking enabled" : "Tracking disabled");
     }
   };
 
-  const _updateStock = async (id: string, qty: number) => {
-    const prev = rows;
-    setRows(rows.map((r) => (r.id === id ? { ...r, stock_qty: qty } : r)));
+  // Debounced DB write only (local state is updated immediately in onChange)
+  const _saveStock = async (id: string, qty: number) => {
     const { error } = await supabase
       .from("products")
       .update({ stock_qty: qty })
       .eq("id", id);
     if (error) {
       toast.error(error.message || "Failed to update stock");
-      setRows(prev);
+      setRefreshKey((k) => k + 1);
     }
   };
-  const updateStock = useDebouncedCallback(_updateStock, 500);
+  const saveStock = useDebouncedCallback(_saveStock, 500);
 
-  // ===== Render
+  const _saveExpiry = async (id: string, ymd: string | null) => {
+    const { error } = await supabase
+      .from("products")
+      .update({ expiry_date: ymd })
+      .eq("id", id);
+    if (error) {
+      toast.error(error.message || "Failed to update expiry date");
+      setRefreshKey((k) => k + 1);
+    }
+  };
+  const saveExpiry = useDebouncedCallback(_saveExpiry, 500);
+
   if (!hydrated || !ready) {
     return (
       <div className="container mx-auto py-16 text-muted-foreground">
@@ -274,7 +335,6 @@ export default function VendorProductsPage() {
 
   return (
     <div className="min-h-screen bg-muted/30">
-      {/* Header */}
       <header className="border-b bg-background">
         <div className="container mx-auto py-4 flex justify-between items-center">
           <div className="flex items-center gap-4">
@@ -293,6 +353,7 @@ export default function VendorProductsPage() {
               <RefreshCcw className="h-4 w-4 mr-2" />
               Refresh
             </Button>
+
             <Button onClick={() => router.push("/vendor/products/single-new")}>
               <Plus className="mr-2 h-4 w-4" />
               Add Single Product
@@ -305,26 +366,32 @@ export default function VendorProductsPage() {
         </div>
       </header>
 
-      {/* Body */}
       <div className="container mx-auto py-8">
         <Card>
           <CardHeader>
-            <div className="flex flex-col md:flex-row md:items-center gap-3 justify-between">
-              <div>
-                <CardTitle>Products</CardTitle>
-                <CardDescription>
-                  Only products owned by your vendor are shown.
-                </CardDescription>
-              </div>
-              <div className="w-full md:w-80">
-                <div className="relative">
-                  <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-                  <Input
-                    placeholder="Search by name, slug, or brand…"
-                    value={search}
-                    onChange={(e) => setSearch(e.target.value)}
-                    className="pl-10"
-                  />
+            <div className="flex flex-col gap-3">
+              <div className="flex flex-col md:flex-row md:items-center gap-3 justify-between">
+                <div>
+                  <CardTitle>Products</CardTitle>
+                  <CardDescription>
+                    Manage inventory, expiry date, visibility and product details.
+                  </CardDescription>
+                </div>
+
+                <div className="w-full md:w-[520px] flex items-center gap-3">
+                  <div className="relative w-full">
+                    <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+                    <Input
+                      placeholder="Search products…"
+                      value={search}
+                      onChange={(e) => setSearch(e.target.value)}
+                      className="pl-10"
+                    />
+                  </div>
+
+                  <div className="text-sm whitespace-nowrap">
+                    Expiry alert window: <b>{alertDays}</b> days
+                  </div>
                 </div>
               </div>
             </div>
@@ -339,16 +406,18 @@ export default function VendorProductsPage() {
                     <TableHead>Brand</TableHead>
                     <TableHead>Price</TableHead>
                     <TableHead className="min-w-[180px]">Stock</TableHead>
+                    <TableHead className="min-w-[220px]">Expiry</TableHead>
                     <TableHead className="min-w-[180px]">Published</TableHead>
                     <TableHead>Updated</TableHead>
                     <TableHead className="text-right">Actions</TableHead>
                   </TableRow>
                 </TableHeader>
+
                 <TableBody>
                   {filtered.length === 0 ? (
                     <TableRow>
                       <TableCell
-                        colSpan={7}
+                        colSpan={8}
                         className="text-center text-muted-foreground py-10"
                       >
                         {loading ? "Loading…" : "No products found"}
@@ -358,6 +427,10 @@ export default function VendorProductsPage() {
                     filtered.map((p) => {
                       const tracking = p.track_inventory ?? true;
                       const stock = p.stock_qty ?? 0;
+
+                      const expiry = p.expiry_date ? String(p.expiry_date).slice(0, 10) : "";
+                      const dl = daysLeftFromYmd(expiry);
+
                       return (
                         <TableRow key={p.id}>
                           <TableCell className="font-medium">
@@ -366,10 +439,10 @@ export default function VendorProductsPage() {
                               {p.slug}
                             </div>
                           </TableCell>
+
                           <TableCell>{p.brands?.name ?? "—"}</TableCell>
-                          <TableCell>
-                            {formatINR(p.price, p.currency)}
-                          </TableCell>
+
+                          <TableCell>{formatINR(p.price, p.currency)}</TableCell>
 
                           {/* Stock */}
                           <TableCell className="whitespace-nowrap">
@@ -384,20 +457,73 @@ export default function VendorProductsPage() {
                                   Track
                                 </span>
                               </div>
+
                               <Input
                                 type="number"
                                 min={0}
-                                defaultValue={stock}
+                                value={stock}
                                 onChange={(e) => {
-                                  const v = Math.max(
-                                    0,
-                                    Number(e.target.value) || 0
+                                  const v = Math.max(0, Number(e.target.value) || 0);
+                                  // local state first (stable)
+                                  setRows((prev) =>
+                                    prev.map((r) =>
+                                      r.id === p.id ? { ...r, stock_qty: v } : r
+                                    )
                                   );
-                                  updateStock(p.id, v);
+                                  // debounced db write
+                                  saveStock(p.id, v);
                                 }}
                                 disabled={!tracking}
                                 className="h-8 w-24"
                               />
+                            </div>
+                          </TableCell>
+
+                          {/* Expiry */}
+                          <TableCell className="whitespace-nowrap">
+                            <div className="flex items-center gap-3">
+                              <Input
+                                type="date"
+                                value={expiry}
+                                onChange={(e) => {
+                                  const v = e.target.value || "";
+                                  setRows((prev) =>
+                                    prev.map((r) =>
+                                      r.id === p.id
+                                        ? { ...r, expiry_date: v || null }
+                                        : r
+                                    )
+                                  );
+                                  saveExpiry(p.id, v ? v : null);
+                                }}
+                                className="h-8 w-[165px]"
+                              />
+
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                className="h-8 px-3"
+                                onClick={() => {
+                                  setRows((prev) =>
+                                    prev.map((r) =>
+                                      r.id === p.id ? { ...r, expiry_date: null } : r
+                                    )
+                                  );
+                                  saveExpiry(p.id, null);
+                                }}
+                                title="Clear expiry"
+                              >
+                                —
+                              </Button>
+
+                              {dl != null ? (
+                                <span
+                                  className={`text-xs px-2 py-1 rounded ${expiryPillClass(dl, alertDays)}`}
+                                >
+                                  {dl < 0 ? `${Math.abs(dl)}d expired` : `${dl}d left`}
+                                </span>
+                              ) : null}
                             </div>
                           </TableCell>
 
@@ -409,25 +535,18 @@ export default function VendorProductsPage() {
                                 onCheckedChange={(v) => togglePublish(p.id, v)}
                                 aria-label="Publish / hide"
                               />
-                              <Badge
-                                variant={
-                                  p.is_published ? "default" : "secondary"
-                                }
-                              >
+                              <Badge variant={p.is_published ? "default" : "secondary"}>
                                 {p.is_published ? "Published" : "Hidden"}
                               </Badge>
                             </div>
                           </TableCell>
 
                           <TableCell className="whitespace-nowrap text-sm">
-                            {new Date(p.updated_at).toLocaleDateString(
-                              "en-IN",
-                              {
-                                year: "numeric",
-                                month: "short",
-                                day: "numeric",
-                              }
-                            )}
+                            {new Date(p.updated_at).toLocaleDateString("en-IN", {
+                              year: "numeric",
+                              month: "short",
+                              day: "numeric",
+                            })}
                           </TableCell>
 
                           <TableCell className="text-right">
@@ -435,9 +554,7 @@ export default function VendorProductsPage() {
                               <Button
                                 variant="ghost"
                                 size="sm"
-                                onClick={() =>
-                                  router.push(`/vendor/products/${p.id}`)
-                                }
+                                onClick={() => router.push(`/vendor/products/${p.id}`)}
                                 title="Edit"
                               >
                                 <Edit className="h-4 w-4" />
@@ -460,7 +577,6 @@ export default function VendorProductsPage() {
               </Table>
             </div>
 
-            {/* Pagination */}
             <div className="mt-4 flex justify-center">
               {paging.more && (
                 <Button

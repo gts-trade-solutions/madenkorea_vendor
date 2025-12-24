@@ -8,7 +8,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
-import { Textarea } from "@/components/ui/textarea"; // if you don't have one, replace with <textarea className="...">
+import { Textarea } from "@/components/ui/textarea";
 import { toast } from "sonner";
 import { Plus, Trash2, Upload } from "lucide-react";
 
@@ -57,79 +57,94 @@ function parseBool(v: any) {
   return ["1", "true", "yes", "y"].includes(s);
 }
 
-type VendorInfo = { id: string; display_name: string; status: "pending"|"approved"|"rejected"|"disabled" };
-type BrandRow = { id: string; slug?: string|null; name?: string|null };
-type CategoryRow = { id: string; slug?: string|null; name?: string|null };
+type VendorInfo = {
+  id: string;
+  display_name: string;
+  status: "pending" | "approved" | "rejected" | "disabled";
+};
+
+type BrandRow = { id: string; slug?: string | null; name?: string | null };
+type CategoryRow = { id: string; slug?: string | null; name?: string | null };
 
 type ImageRow = {
-  id?: string;          // product_images.id (existing)
-  file?: File;          // new upload
-  storage_path?: string; // existing path in bucket (e.g. sku/file.jpg)
+  id?: string;
+  file?: File;
+  storage_path?: string;
   alt: string;
   sort_order: number;
-  // UI flags
-  remove?: boolean;     // delete this image row from DB
+  remove?: boolean;
 };
 
 type ProductModel = {
   id?: string;
   vendor_id?: string;
+
   sku: string;
   slug: string;
   name: string;
   brand_id: string | "";
   category_id: string | "";
+
   price: number | null;
   currency: string;
+
   short_description: string;
   description: string;
+
+  // inventory + expiry (NEW)
+  track_inventory: boolean;
+  stock_qty: number;
+  expiry_date: string; // YYYY-MM-DD or ""
+
   // publish & price
   is_published: boolean;
   compare_at_price: number | null;
   sale_price: number | null;
   sale_starts_at: string | "";
   sale_ends_at: string | "";
+
   // badges
   made_in_korea: boolean;
   is_vegetarian: boolean;
   cruelty_free: boolean;
   toxin_free: boolean;
   paraben_free: boolean;
+
   // SEO / rich
   meta_title: string;
   meta_description: string;
   ingredients_md: string;
   key_features_md: string;
   additional_details_md: string;
-  attributes_json: string; // JSON text, parsed to jsonb
-  faq_text: string;        // "Q?::A||Q2?::A2" (converted to jsonb)
-  key_benefits_text: string; // "Hydrating|Soothing" (converted to text[])
+  attributes_json: string;
+  faq_text: string;
+  key_benefits_text: string;
+
   // misc
   volume_ml: number | null;
   net_weight_g: number | null;
   country_of_origin: string;
-  // media (derived or selected)
-  images: ImageRow[]; // up to 5
+
+  // media
+  images: ImageRow[];
   video_file?: File | null;
-  video_path?: string | null; // existing video
+  video_path?: string | null;
   remove_video?: boolean;
 };
 
 export function ProductEditor({
-  mode,           // "create" | "edit"
-  productId,      // required if mode === "edit"
+  mode,
+  productId,
 }: {
   mode: "create" | "edit";
   productId?: string;
 }) {
   const router = useRouter();
 
-  // vendor + lookups
   const [vendor, setVendor] = useState<VendorInfo | null>(null);
   const [brands, setBrands] = useState<BrandRow[]>([]);
   const [categories, setCategories] = useState<CategoryRow[]>([]);
 
-  // form state
   const [model, setModel] = useState<ProductModel>(() => ({
     sku: "",
     slug: "",
@@ -140,6 +155,11 @@ export function ProductEditor({
     currency: "INR",
     short_description: "",
     description: "",
+
+    // inventory + expiry defaults (NEW)
+    track_inventory: true,
+    stock_qty: 0,
+    expiry_date: "",
 
     is_published: true,
     compare_at_price: null,
@@ -158,7 +178,7 @@ export function ProductEditor({
     ingredients_md: "",
     key_features_md: "",
     additional_details_md: "",
-    attributes_json: "{}",        // jsonb NOT NULL in your schema
+    attributes_json: "{}",
     faq_text: "",
     key_benefits_text: "",
 
@@ -176,25 +196,46 @@ export function ProductEditor({
   const [overwriteStorage, setOverwriteStorage] = useState(false);
   const [deleteMediaFromStorage, setDeleteMediaFromStorage] = useState(false);
 
-  // hydrate vendor + lookups + (edit) product
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      const { data: { session } } = await supabase.auth.getSession();
-      if (!session?.user) { router.replace("/vendor/login"); return; }
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+      if (!session?.user) {
+        router.replace("/vendor/login");
+        return;
+      }
 
       const { data: rpc, error: rpcErr } = await supabase.rpc("get_my_vendor");
-      if (rpcErr) { toast.error(rpcErr.message); router.replace("/vendor"); return; }
+      if (rpcErr) {
+        toast.error(rpcErr.message);
+        router.replace("/vendor");
+        return;
+      }
       const vArr = Array.isArray(rpc) ? rpc : rpc ? [rpc] : [];
       const v = vArr[0] as VendorInfo | undefined;
-      if (!v) { router.replace("/vendor/register"); return; }
-      if (v.status !== "approved") { router.replace("/vendor"); return; }
+
+      if (!v) {
+        router.replace("/vendor/register");
+        return;
+      }
+      if (v.status !== "approved") {
+        router.replace("/vendor");
+        return;
+      }
       if (cancelled) return;
       setVendor(v);
 
       const [br, cat] = await Promise.all([
-        supabase.from("brands").select("id,slug,name").order("name", { ascending: true }),
-        supabase.from("categories").select("id,slug,name").order("name", { ascending: true }),
+        supabase
+          .from("brands")
+          .select("id,slug,name")
+          .order("name", { ascending: true }),
+        supabase
+          .from("categories")
+          .select("id,slug,name")
+          .order("name", { ascending: true }),
       ]);
       if (!cancelled) {
         setBrands((br.data as any[]) || []);
@@ -202,7 +243,6 @@ export function ProductEditor({
       }
 
       if (mode === "edit" && productId) {
-        // Only load product owned by this vendor
         const { data: prod, error: perr } = await supabase
           .from("products")
           .select("*")
@@ -210,10 +250,16 @@ export function ProductEditor({
           .eq("vendor_id", v.id)
           .maybeSingle();
 
-        if (perr) { toast.error(perr.message); return; }
-        if (!prod) { toast.error("Product not found"); router.replace("/vendor/products"); return; }
+        if (perr) {
+          toast.error(perr.message);
+          return;
+        }
+        if (!prod) {
+          toast.error("Product not found");
+          router.replace("/vendor/products");
+          return;
+        }
 
-        // Load gallery images
         const { data: imgs } = await supabase
           .from("product_images")
           .select("id, storage_path, alt, sort_order")
@@ -233,6 +279,12 @@ export function ProductEditor({
           currency: prod.currency || "INR",
           short_description: prod.short_description || "",
           description: prod.description || "",
+
+          // inventory + expiry from DB (NEW)
+          track_inventory: parseBool(prod.track_inventory ?? true),
+          stock_qty: Number(prod.stock_qty ?? 0),
+          expiry_date: prod.expiry_date ? String(prod.expiry_date).slice(0, 10) : "",
+
           is_published: parseBool(prod.is_published),
           compare_at_price: prod.compare_at_price ?? null,
           sale_price: prod.sale_price ?? null,
@@ -250,26 +302,40 @@ export function ProductEditor({
           additional_details_md: prod.additional_details_md || "",
           attributes_json: JSON.stringify(prod.attributes ?? {}, null, 0),
           faq_text: ((prod.faq ?? []) as any[])
-            .map((x: any) => `${x?.q ?? ""}::${x?.a ?? ""}`).filter(Boolean).join("||"),
+            .map((x: any) => `${x?.q ?? ""}::${x?.a ?? ""}`)
+            .filter(Boolean)
+            .join("||"),
           key_benefits_text: ((prod.key_benefits ?? []) as any[]).join("|"),
           volume_ml: prod.volume_ml ?? null,
           net_weight_g: prod.net_weight_g ?? null,
           country_of_origin: prod.country_of_origin || "",
           video_path: prod.video_path ?? null,
           images: (imgs ?? []).map((r) => ({
-            id: r.id, storage_path: r.storage_path, alt: r.alt ?? "", sort_order: r.sort_order ?? 0,
+            id: r.id,
+            storage_path: r.storage_path,
+            alt: r.alt ?? "",
+            sort_order: r.sort_order ?? 0,
           })),
         }));
       }
     })();
-    return () => { cancelled = true; };
+
+    return () => {
+      cancelled = true;
+    };
   }, [mode, productId, router]);
 
   const addImageSlot = () => {
     setModel((m) => {
       if (m.images.length >= 5) return m;
       const nextSort = (m.images[m.images.length - 1]?.sort_order ?? -1) + 1;
-      return { ...m, images: [...m.images, { alt: "", sort_order: Math.max(0, nextSort) }] };
+      return {
+        ...m,
+        images: [
+          ...m.images,
+          { alt: "", sort_order: Math.max(0, nextSort) },
+        ],
+      };
     });
   };
 
@@ -277,39 +343,38 @@ export function ProductEditor({
     setModel((m) => {
       const copy = [...m.images];
       const row = copy[idx];
-      if (row?.id) {
-        // existing row → mark remove
-        copy[idx] = { ...row, remove: true };
-      } else {
-        copy.splice(idx, 1);
-      }
+      if (row?.id) copy[idx] = { ...row, remove: true };
+      else copy.splice(idx, 1);
       return { ...m, images: copy };
     });
   };
 
   const canSave = useMemo(() => {
-    return !!model.name && !!(model.brand_id) && !!(model.category_id);
+    return !!model.name && !!model.brand_id && !!model.category_id;
   }, [model]);
 
-  /* ── Save (create/update + media) ── */
   const onSave = async (closeAfter = false) => {
-    if (!vendor) { toast.error("Vendor not ready"); return; }
-    if (!canSave) { toast.error("Please fill name, brand and category"); return; }
+    if (!vendor) {
+      toast.error("Vendor not ready");
+      return;
+    }
+    if (!canSave) {
+      toast.error("Please fill name, brand and category");
+      return;
+    }
     setBusy(true);
+
     try {
-      // 1) Normalize identity
       let sku = model.sku?.trim();
       if (!sku) {
         const seed = model.slug?.trim() || model.name || "PRODUCT";
         sku = skuify(seed);
-      } else {
-        sku = skuify(sku);
-      }
+      } else sku = skuify(sku);
+
       let slug = model.slug?.trim();
       if (!slug) slug = slugify(sku || model.name || "product");
       else slug = slugify(slug);
 
-      // 2) Build base product payload
       const payload: any = {
         sku,
         slug,
@@ -328,6 +393,11 @@ export function ProductEditor({
         sale_ends_at: model.sale_ends_at || null,
         is_published: !!model.is_published,
 
+        // inventory + expiry (NEW)
+        track_inventory: !!model.track_inventory,
+        stock_qty: Math.max(0, Number(model.stock_qty || 0)),
+        expiry_date: model.expiry_date ? model.expiry_date : null,
+
         made_in_korea: !!model.made_in_korea,
         is_vegetarian: !!model.is_vegetarian,
         cruelty_free: !!model.cruelty_free,
@@ -340,7 +410,11 @@ export function ProductEditor({
         key_features_md: model.key_features_md || null,
         additional_details_md: model.additional_details_md || null,
         attributes: (() => {
-          try { return JSON.parse(model.attributes_json || "{}"); } catch { return {}; }
+          try {
+            return JSON.parse(model.attributes_json || "{}");
+          } catch {
+            return {};
+          }
         })(),
         faq: (model.faq_text || "")
           .split("||")
@@ -362,8 +436,8 @@ export function ProductEditor({
 
       if (mode === "create") payload.vendor_id = vendor.id;
 
-      // 3) Upsert product (first, without media paths)
       let prodId = model.id;
+
       if (mode === "create") {
         const { data, error } = await supabase
           .from("products")
@@ -383,13 +457,20 @@ export function ProductEditor({
         if (error) throw new Error(error.message);
         prodId = data?.id;
       }
+
       if (!prodId) throw new Error("No product id");
 
-      // 4) Media handling
-      // 4a) Upload new images, build rows
+      // =======================
+      // Media handling (UNCHANGED)
+      // =======================
       const bucket = "product-media";
       const safeSku = safeKeyPart(sku);
-      const imgRows: { product_id: string; storage_path: string; alt: string|null; sort_order: number }[] = [];
+      const imgRows: {
+        product_id: string;
+        storage_path: string;
+        alt: string | null;
+        sort_order: number;
+      }[] = [];
       const toDeleteImgIds: string[] = [];
 
       for (const row of model.images) {
@@ -401,9 +482,13 @@ export function ProductEditor({
         if (row.file) {
           const cleanName = safeKeyPart(row.file.name);
           const key = `${safeSku}/${cleanName}`;
-          const { error: upErr } = await supabase
-            .storage.from(bucket)
-            .upload(key, row.file, { upsert: overwriteStorage, cacheControl: "31536000", contentType: row.file.type || undefined });
+          const { error: upErr } = await supabase.storage
+            .from(bucket)
+            .upload(key, row.file, {
+              upsert: overwriteStorage,
+              cacheControl: "31536000",
+              contentType: row.file.type || undefined,
+            });
           if (upErr && upErr.message?.includes("already exists") && !overwriteStorage) {
             throw new Error(`Image already exists in storage: ${key}`);
           }
@@ -414,12 +499,13 @@ export function ProductEditor({
             product_id: prodId,
             storage_path,
             alt: row.alt || null,
-            sort_order: Number.isFinite(row.sort_order as any) ? (row.sort_order as number) : 0,
+            sort_order: Number.isFinite(row.sort_order as any)
+              ? (row.sort_order as number)
+              : 0,
           });
         }
       }
 
-      // 4b) Apply image deletions
       if (toDeleteImgIds.length) {
         const { error: delErr } = await supabase
           .from("product_images")
@@ -428,7 +514,6 @@ export function ProductEditor({
         if (delErr) throw new Error(delErr.message);
 
         if (deleteMediaFromStorage) {
-          // fetch deleted rows to know their paths
           const { data: gone } = await supabase
             .from("product_images")
             .select("storage_path")
@@ -438,7 +523,6 @@ export function ProductEditor({
         }
       }
 
-      // 4c) Upsert images (unique index product_id,storage_path recommended)
       if (imgRows.length) {
         const { error: imgErr } = await supabase
           .from("product_images")
@@ -446,7 +530,6 @@ export function ProductEditor({
         if (imgErr) throw new Error(imgErr.message);
       }
 
-      // 4d) Video: upload or remove
       let nextVideoPath = model.video_path || null;
       if (model.remove_video) {
         const { error: vidNullErr } = await supabase
@@ -462,9 +545,11 @@ export function ProductEditor({
       } else if (model.video_file) {
         const cleanVid = safeKeyPart(model.video_file.name);
         const key = `${safeSku}/video/${cleanVid}`;
-        const { error: vErr } = await supabase
-          .storage.from(bucket)
-          .upload(key, model.video_file, { upsert: overwriteStorage, cacheControl: "31536000", contentType: model.video_file.type || undefined });
+        const { error: vErr } = await supabase.storage.from(bucket).upload(key, model.video_file, {
+          upsert: overwriteStorage,
+          cacheControl: "31536000",
+          contentType: model.video_file.type || undefined,
+        });
         if (vErr && vErr.message?.includes("already exists") && !overwriteStorage) {
           throw new Error(`Video already exists in storage: ${key}`);
         }
@@ -477,11 +562,12 @@ export function ProductEditor({
         if (setVidErr) throw new Error(setVidErr.message);
       }
 
-      // 4e) Derive hero/og from first two images if we *submitted* any images this run
       if (imgRows.length) {
-        const sorted = imgRows.slice().sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0));
+        const sorted = imgRows
+          .slice()
+          .sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0));
         const hero = sorted[0]?.storage_path ?? null;
-        const og   = sorted[1]?.storage_path ?? null;
+        const og = sorted[1]?.storage_path ?? null;
         const { error: heroErr } = await supabase
           .from("products")
           .update({ hero_image_path: hero, og_image_path: og })
@@ -500,7 +586,6 @@ export function ProductEditor({
     }
   };
 
-  // previews for existing storage images (public bucket or signed if needed)
   const [publicUrls, setPublicUrls] = useState<Record<number, string>>({});
   useEffect(() => {
     (async () => {
@@ -508,7 +593,9 @@ export function ProductEditor({
       await Promise.all(
         model.images.map(async (row, idx) => {
           if (row.storage_path && !row.file) {
-            const { data } = supabase.storage.from("product-media").getPublicUrl(row.storage_path);
+            const { data } = supabase.storage
+              .from("product-media")
+              .getPublicUrl(row.storage_path);
             out[idx] = data.publicUrl;
           }
         })
@@ -517,32 +604,55 @@ export function ProductEditor({
     })();
   }, [model.images]);
 
-  if (!vendor) return <div className="container mx-auto py-16 text-muted-foreground">Loading…</div>;
+  if (!vendor)
+    return (
+      <div className="container mx-auto py-16 text-muted-foreground">
+        Loading…
+      </div>
+    );
 
   return (
     <div className="container mx-auto py-6">
       <div className="mb-4">
-        <Button variant="ghost" onClick={() => router.push("/vendor/products")}>← Back</Button>
+        <Button variant="ghost" onClick={() => router.push("/vendor/products")}>
+          ← Back
+        </Button>
       </div>
 
       <Card>
         <CardHeader>
           <CardTitle>{mode === "create" ? "Add Product" : "Edit Product"}</CardTitle>
         </CardHeader>
+
         <CardContent className="space-y-8">
           {/* Identity */}
           <section className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div>
               <Label>Name</Label>
-              <Input value={model.name} onChange={e => setModel(m => ({...m, name: e.target.value}))} />
+              <Input
+                value={model.name}
+                onChange={(e) =>
+                  setModel((m) => ({ ...m, name: e.target.value }))
+                }
+              />
             </div>
             <div>
               <Label>Slug (leave blank to auto-generate)</Label>
-              <Input value={model.slug} onChange={e => setModel(m => ({...m, slug: e.target.value}))} />
+              <Input
+                value={model.slug}
+                onChange={(e) =>
+                  setModel((m) => ({ ...m, slug: e.target.value }))
+                }
+              />
             </div>
             <div>
               <Label>SKU (leave blank to auto-generate)</Label>
-              <Input value={model.sku} onChange={e => setModel(m => ({...m, sku: e.target.value}))} />
+              <Input
+                value={model.sku}
+                onChange={(e) =>
+                  setModel((m) => ({ ...m, sku: e.target.value }))
+                }
+              />
             </div>
             <div className="grid grid-cols-2 gap-4">
               <div>
@@ -550,21 +660,34 @@ export function ProductEditor({
                 <select
                   className="w-full h-10 border rounded-md bg-background px-3"
                   value={model.brand_id}
-                  onChange={(e) => setModel(m => ({...m, brand_id: e.target.value}))}
+                  onChange={(e) =>
+                    setModel((m) => ({ ...m, brand_id: e.target.value }))
+                  }
                 >
                   <option value="">Select brand</option>
-                  {brands.map(b => <option key={b.id} value={b.id}>{b.name || b.slug || b.id}</option>)}
+                  {brands.map((b) => (
+                    <option key={b.id} value={b.id}>
+                      {b.name || b.slug || b.id}
+                    </option>
+                  ))}
                 </select>
               </div>
+
               <div>
                 <Label>Category</Label>
                 <select
                   className="w-full h-10 border rounded-md bg-background px-3"
                   value={model.category_id}
-                  onChange={(e) => setModel(m => ({...m, category_id: e.target.value}))}
+                  onChange={(e) =>
+                    setModel((m) => ({ ...m, category_id: e.target.value }))
+                  }
                 >
                   <option value="">Select category</option>
-                  {categories.map(c => <option key={c.id} value={c.id}>{c.name || c.slug || c.id}</option>)}
+                  {categories.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.name || c.slug || c.id}
+                    </option>
+                  ))}
                 </select>
               </div>
             </div>
@@ -574,13 +697,23 @@ export function ProductEditor({
           <section className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div>
               <Label>Short description</Label>
-              <Textarea rows={3} value={model.short_description}
-                onChange={e => setModel(m => ({...m, short_description: e.target.value}))} />
+              <Textarea
+                rows={3}
+                value={model.short_description}
+                onChange={(e) =>
+                  setModel((m) => ({ ...m, short_description: e.target.value }))
+                }
+              />
             </div>
             <div>
               <Label>Description</Label>
-              <Textarea rows={6} value={model.description}
-                onChange={e => setModel(m => ({...m, description: e.target.value}))} />
+              <Textarea
+                rows={6}
+                value={model.description}
+                onChange={(e) =>
+                  setModel((m) => ({ ...m, description: e.target.value }))
+                }
+              />
             </div>
           </section>
 
@@ -588,49 +721,146 @@ export function ProductEditor({
           <section className="grid grid-cols-1 md:grid-cols-3 gap-4">
             <div>
               <Label>Price</Label>
-              <Input type="number" min="0" step="0.01"
-                value={model.price ?? ""} onChange={e => setModel(m => ({...m, price: e.target.value ? Number(e.target.value) : null}))} />
+              <Input
+                type="number"
+                min="0"
+                step="0.01"
+                value={model.price ?? ""}
+                onChange={(e) =>
+                  setModel((m) => ({
+                    ...m,
+                    price: e.target.value ? Number(e.target.value) : null,
+                  }))
+                }
+              />
             </div>
             <div>
               <Label>Compare at price</Label>
-              <Input type="number" min="0" step="0.01"
-                value={model.compare_at_price ?? ""} onChange={e => setModel(m => ({...m, compare_at_price: e.target.value ? Number(e.target.value) : null}))} />
+              <Input
+                type="number"
+                min="0"
+                step="0.01"
+                value={model.compare_at_price ?? ""}
+                onChange={(e) =>
+                  setModel((m) => ({
+                    ...m,
+                    compare_at_price: e.target.value
+                      ? Number(e.target.value)
+                      : null,
+                  }))
+                }
+              />
             </div>
             <div>
               <Label>Sale price</Label>
-              <Input type="number" min="0" step="0.01"
-                value={model.sale_price ?? ""} onChange={e => setModel(m => ({...m, sale_price: e.target.value ? Number(e.target.value) : null}))} />
+              <Input
+                type="number"
+                min="0"
+                step="0.01"
+                value={model.sale_price ?? ""}
+                onChange={(e) =>
+                  setModel((m) => ({
+                    ...m,
+                    sale_price: e.target.value ? Number(e.target.value) : null,
+                  }))
+                }
+              />
             </div>
             <div>
               <Label>Sale starts at</Label>
-              <Input type="datetime-local"
-                value={model.sale_starts_at || ""} onChange={e => setModel(m => ({...m, sale_starts_at: e.target.value}))} />
+              <Input
+                type="datetime-local"
+                value={model.sale_starts_at || ""}
+                onChange={(e) =>
+                  setModel((m) => ({ ...m, sale_starts_at: e.target.value }))
+                }
+              />
             </div>
             <div>
               <Label>Sale ends at</Label>
-              <Input type="datetime-local"
-                value={model.sale_ends_at || ""} onChange={e => setModel(m => ({...m, sale_ends_at: e.target.value}))} />
+              <Input
+                type="datetime-local"
+                value={model.sale_ends_at || ""}
+                onChange={(e) =>
+                  setModel((m) => ({ ...m, sale_ends_at: e.target.value }))
+                }
+              />
             </div>
 
             <div className="flex items-center gap-3">
-              <Switch checked={model.is_published}
-                onCheckedChange={(v) => setModel(m => ({...m, is_published: v}))} />
+              <Switch
+                checked={model.is_published}
+                onCheckedChange={(v) =>
+                  setModel((m) => ({ ...m, is_published: v }))
+                }
+              />
               <Label className="!m-0">Published</Label>
+            </div>
+          </section>
+
+          {/* Inventory + Expiry (NEW) */}
+          <section className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div className="flex items-center gap-3 border rounded-md px-3 py-2">
+              <Switch
+                checked={model.track_inventory}
+                onCheckedChange={(v) =>
+                  setModel((m) => ({ ...m, track_inventory: v }))
+                }
+              />
+              <div>
+                <div className="text-sm font-medium">Track inventory</div>
+                <div className="text-xs text-muted-foreground">
+                  If off, stock won’t block checkout.
+                </div>
+              </div>
+            </div>
+
+            <div>
+              <Label>Stock qty</Label>
+              <Input
+                type="number"
+                min={0}
+                value={model.stock_qty}
+                onChange={(e) =>
+                  setModel((m) => ({
+                    ...m,
+                    stock_qty: Math.max(0, Number(e.target.value) || 0),
+                  }))
+                }
+              />
+            </div>
+
+            <div>
+              <Label>Expiry date</Label>
+              <Input
+                type="date"
+                value={model.expiry_date || ""}
+                onChange={(e) =>
+                  setModel((m) => ({ ...m, expiry_date: e.target.value }))
+                }
+              />
             </div>
           </section>
 
           {/* Badges */}
           <section className="grid grid-cols-2 md:grid-cols-5 gap-3">
             {[
-              ["made_in_korea","Made in Korea"],
-              ["is_vegetarian","Vegetarian"],
-              ["cruelty_free","Cruelty-free"],
-              ["toxin_free","Toxin-free"],
-              ["paraben_free","Paraben-free"],
+              ["made_in_korea", "Made in Korea"],
+              ["is_vegetarian", "Vegetarian"],
+              ["cruelty_free", "Cruelty-free"],
+              ["toxin_free", "Toxin-free"],
+              ["paraben_free", "Paraben-free"],
             ].map(([key, label]) => (
-              <label key={key} className="flex items-center gap-3 border rounded-md px-3 py-2">
-                <Switch checked={(model as any)[key]}
-                  onCheckedChange={(v)=>setModel(m=>({...m,[key]:v}))} />
+              <label
+                key={key}
+                className="flex items-center gap-3 border rounded-md px-3 py-2"
+              >
+                <Switch
+                  checked={(model as any)[key]}
+                  onCheckedChange={(v) =>
+                    setModel((m) => ({ ...m, [key]: v } as any))
+                  }
+                />
                 <span>{label}</span>
               </label>
             ))}
@@ -640,35 +870,90 @@ export function ProductEditor({
           <section className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div>
               <Label>Meta title</Label>
-              <Input value={model.meta_title} onChange={e => setModel(m=>({...m, meta_title: e.target.value}))} />
+              <Input
+                value={model.meta_title}
+                onChange={(e) =>
+                  setModel((m) => ({ ...m, meta_title: e.target.value }))
+                }
+              />
             </div>
             <div>
               <Label>Meta description</Label>
-              <Textarea rows={3} value={model.meta_description} onChange={e => setModel(m=>({...m, meta_description: e.target.value}))} />
+              <Textarea
+                rows={3}
+                value={model.meta_description}
+                onChange={(e) =>
+                  setModel((m) => ({
+                    ...m,
+                    meta_description: e.target.value,
+                  }))
+                }
+              />
             </div>
             <div>
               <Label>Ingredients (markdown)</Label>
-              <Textarea rows={4} value={model.ingredients_md} onChange={e => setModel(m=>({...m, ingredients_md: e.target.value}))} />
+              <Textarea
+                rows={4}
+                value={model.ingredients_md}
+                onChange={(e) =>
+                  setModel((m) => ({ ...m, ingredients_md: e.target.value }))
+                }
+              />
             </div>
             <div>
               <Label>Key features (markdown)</Label>
-              <Textarea rows={4} value={model.key_features_md} onChange={e => setModel(m=>({...m, key_features_md: e.target.value}))} />
+              <Textarea
+                rows={4}
+                value={model.key_features_md}
+                onChange={(e) =>
+                  setModel((m) => ({ ...m, key_features_md: e.target.value }))
+                }
+              />
             </div>
             <div>
               <Label>Additional details (markdown)</Label>
-              <Textarea rows={4} value={model.additional_details_md} onChange={e => setModel(m=>({...m, additional_details_md: e.target.value}))} />
+              <Textarea
+                rows={4}
+                value={model.additional_details_md}
+                onChange={(e) =>
+                  setModel((m) => ({
+                    ...m,
+                    additional_details_md: e.target.value,
+                  }))
+                }
+              />
             </div>
             <div>
               <Label>Attributes (JSON)</Label>
-              <Textarea rows={4} value={model.attributes_json} onChange={e => setModel(m=>({...m, attributes_json: e.target.value}))} />
+              <Textarea
+                rows={4}
+                value={model.attributes_json}
+                onChange={(e) =>
+                  setModel((m) => ({ ...m, attributes_json: e.target.value }))
+                }
+              />
             </div>
             <div>
               <Label>FAQ (Q::A pairs, separated by ||)</Label>
-              <Textarea rows={3} value={model.faq_text} onChange={e => setModel(m=>({...m, faq_text: e.target.value}))} />
+              <Textarea
+                rows={3}
+                value={model.faq_text}
+                onChange={(e) =>
+                  setModel((m) => ({ ...m, faq_text: e.target.value }))
+                }
+              />
             </div>
             <div>
               <Label>Key benefits (separate with |)</Label>
-              <Input value={model.key_benefits_text} onChange={e=>setModel(m=>({...m, key_benefits_text: e.target.value}))} />
+              <Input
+                value={model.key_benefits_text}
+                onChange={(e) =>
+                  setModel((m) => ({
+                    ...m,
+                    key_benefits_text: e.target.value,
+                  }))
+                }
+              />
             </div>
           </section>
 
@@ -676,31 +961,65 @@ export function ProductEditor({
           <section className="grid grid-cols-1 md:grid-cols-3 gap-4">
             <div>
               <Label>Volume (ml)</Label>
-              <Input type="number" min="0" step="0.01"
-                value={model.volume_ml ?? ""} onChange={e => setModel(m => ({...m, volume_ml: e.target.value ? Number(e.target.value) : null}))} />
+              <Input
+                type="number"
+                min="0"
+                step="0.01"
+                value={model.volume_ml ?? ""}
+                onChange={(e) =>
+                  setModel((m) => ({
+                    ...m,
+                    volume_ml: e.target.value ? Number(e.target.value) : null,
+                  }))
+                }
+              />
             </div>
             <div>
               <Label>Net weight (g)</Label>
-              <Input type="number" min="0" step="0.01"
-                value={model.net_weight_g ?? ""} onChange={e => setModel(m => ({...m, net_weight_g: e.target.value ? Number(e.target.value) : null}))} />
+              <Input
+                type="number"
+                min="0"
+                step="0.01"
+                value={model.net_weight_g ?? ""}
+                onChange={(e) =>
+                  setModel((m) => ({
+                    ...m,
+                    net_weight_g: e.target.value ? Number(e.target.value) : null,
+                  }))
+                }
+              />
             </div>
             <div>
               <Label>Country of origin</Label>
-              <Input value={model.country_of_origin} onChange={e=>setModel(m=>({...m, country_of_origin: e.target.value}))} />
+              <Input
+                value={model.country_of_origin}
+                onChange={(e) =>
+                  setModel((m) => ({
+                    ...m,
+                    country_of_origin: e.target.value,
+                  }))
+                }
+              />
             </div>
           </section>
 
-          {/* Media */}
+          {/* Media (UNCHANGED) */}
           <section className="space-y-4">
             <div className="flex items-center justify-between">
               <h3 className="text-lg font-medium">Images (up to 5)</h3>
               <div className="flex items-center gap-3">
                 <label className="flex items-center gap-2 text-sm">
-                  <Switch checked={overwriteStorage} onCheckedChange={setOverwriteStorage} />
+                  <Switch
+                    checked={overwriteStorage}
+                    onCheckedChange={setOverwriteStorage}
+                  />
                   <span>Overwrite storage files</span>
                 </label>
                 <label className="flex items-center gap-2 text-sm">
-                  <Switch checked={deleteMediaFromStorage} onCheckedChange={setDeleteMediaFromStorage} />
+                  <Switch
+                    checked={deleteMediaFromStorage}
+                    onCheckedChange={setDeleteMediaFromStorage}
+                  />
                   <span>Delete files from storage on remove</span>
                 </label>
               </div>
@@ -708,23 +1027,39 @@ export function ProductEditor({
 
             <div className="grid gap-4 md:grid-cols-2">
               {model.images.map((row, idx) => (
-                <div key={idx} className={`rounded-lg border p-3 ${row.remove ? "opacity-60" : ""}`}>
+                <div
+                  key={idx}
+                  className={`rounded-lg border p-3 ${
+                    row.remove ? "opacity-60" : ""
+                  }`}
+                >
                   <div className="flex items-center justify-between mb-2">
                     <div className="text-sm font-medium">Image #{idx + 1}</div>
-                    <Button variant="ghost" size="sm" onClick={() => removeImageSlot(idx)}>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => removeImageSlot(idx)}
+                    >
                       <Trash2 className="h-4 w-4 text-destructive" />
                     </Button>
                   </div>
 
-                  {/* Preview if existing path or newly chosen */}
                   <div className="mb-2">
                     {row.file ? (
-                      <div className="text-xs text-muted-foreground">{row.file.name}</div>
+                      <div className="text-xs text-muted-foreground">
+                        {row.file.name}
+                      </div>
                     ) : row.storage_path ? (
                       // eslint-disable-next-line @next/next/no-img-element
-                      <img src={publicUrls[idx]} alt="" className="h-24 w-24 object-cover rounded border" />
+                      <img
+                        src={publicUrls[idx]}
+                        alt=""
+                        className="h-24 w-24 object-cover rounded border"
+                      />
                     ) : (
-                      <div className="text-xs text-muted-foreground">No file selected</div>
+                      <div className="text-xs text-muted-foreground">
+                        No file selected
+                      </div>
                     )}
                   </div>
 
@@ -737,32 +1072,47 @@ export function ProductEditor({
                         onChange={(e) => {
                           const f = e.target.files?.[0];
                           if (!f) return;
-                          setModel(m => {
+                          setModel((m) => {
                             const copy = [...m.images];
-                            copy[idx] = { ...copy[idx], file: f, storage_path: undefined };
+                            copy[idx] = {
+                              ...copy[idx],
+                              file: f,
+                              storage_path: undefined,
+                            };
                             return { ...m, images: copy };
                           });
                         }}
                       />
                     </div>
+
                     <div>
                       <Label>ALT text</Label>
                       <Input
                         value={row.alt}
-                        onChange={(e) => setModel(m => {
-                          const copy = [...m.images]; copy[idx] = { ...copy[idx], alt: e.target.value }; return { ...m, images: copy };
-                        })}
+                        onChange={(e) =>
+                          setModel((m) => {
+                            const copy = [...m.images];
+                            copy[idx] = { ...copy[idx], alt: e.target.value };
+                            return { ...m, images: copy };
+                          })
+                        }
                       />
                     </div>
+
                     <div>
                       <Label>Sort order</Label>
                       <Input
-                        type="number" min="0"
+                        type="number"
+                        min="0"
                         value={row.sort_order}
-                        onChange={(e) => setModel(m => {
-                          const v = Number(e.target.value) || 0;
-                          const copy = [...m.images]; copy[idx] = { ...copy[idx], sort_order: v }; return { ...m, images: copy };
-                        })}
+                        onChange={(e) =>
+                          setModel((m) => {
+                            const v = Number(e.target.value) || 0;
+                            const copy = [...m.images];
+                            copy[idx] = { ...copy[idx], sort_order: v };
+                            return { ...m, images: copy };
+                          })
+                        }
                       />
                     </div>
                   </div>
@@ -770,7 +1120,7 @@ export function ProductEditor({
               ))}
             </div>
 
-            {model.images.filter(x => !x.remove).length < 5 && (
+            {model.images.filter((x) => !x.remove).length < 5 && (
               <Button variant="outline" onClick={addImageSlot}>
                 <Plus className="h-4 w-4 mr-2" /> Add Image
               </Button>
@@ -784,15 +1134,32 @@ export function ProductEditor({
                   <Input
                     type="file"
                     accept="video/mp4,video/webm"
-                    onChange={(e) => setModel(m => ({...m, video_file: e.target.files?.[0] || null, remove_video: false}))}
+                    onChange={(e) =>
+                      setModel((m) => ({
+                        ...m,
+                        video_file: e.target.files?.[0] || null,
+                        remove_video: false,
+                      }))
+                    }
                   />
                   {model.video_path && !model.video_file && (
-                    <div className="mt-1 text-xs text-muted-foreground">Existing: {model.video_path}</div>
+                    <div className="mt-1 text-xs text-muted-foreground">
+                      Existing: {model.video_path}
+                    </div>
                   )}
                 </div>
+
                 <label className="flex items-center gap-3 mt-6">
-                  <Switch checked={!!model.remove_video}
-                    onCheckedChange={(v) => setModel(m => ({...m, remove_video: v, video_file: v ? null : m.video_file}))} />
+                  <Switch
+                    checked={!!model.remove_video}
+                    onCheckedChange={(v) =>
+                      setModel((m) => ({
+                        ...m,
+                        remove_video: v,
+                        video_file: v ? null : m.video_file,
+                      }))
+                    }
+                  />
                   <span>Remove existing video</span>
                 </label>
               </div>
@@ -804,7 +1171,11 @@ export function ProductEditor({
             <Button onClick={() => onSave(false)} disabled={busy || !canSave}>
               <Upload className="h-4 w-4 mr-2" /> Save
             </Button>
-            <Button variant="secondary" onClick={() => onSave(true)} disabled={busy || !canSave}>
+            <Button
+              variant="secondary"
+              onClick={() => onSave(true)}
+              disabled={busy || !canSave}
+            >
               Save & Close
             </Button>
           </div>
