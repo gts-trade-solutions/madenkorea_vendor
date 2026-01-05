@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { createClient } from "@supabase/supabase-js";
@@ -35,13 +35,29 @@ type VendorInfo = {
   email?: string | null;
 };
 
-type ExpiringRow = {
-  id: string;
-  name: string;
-  slug: string;
+type ExpiringUnitRow = {
+  unit_id: string;
+  unit_code: string;
+  product_id: string;
+  product_name: string;
+  product_slug: string;
   expiry_date: string; // YYYY-MM-DD
-  stock_qty: number;
   days_left: number;
+  status: "IN_STOCK" | "INVOICED" | "DEMO";
+};
+
+type ProductUnitAgg = {
+  product_id: string;
+  product_name: string;
+  product_slug: string;
+  in_stock: number;
+  invoiced: number;
+  demo: number;
+  sold: number;
+  returned: number;
+  total: number;
+  next_expiry_date: string | null;
+  next_expiry_days_left: number | null;
 };
 
 const supabase = createClient(
@@ -89,30 +105,35 @@ function expiryClass(daysLeft: number, alertDays: number) {
 
 export default function VendorDashboard() {
   const router = useRouter();
-  const { user } = useAuth(); // ✅ only user, no logout
+  const { user } = useAuth();
 
   const [hydrated, setHydrated] = useState(false);
   const [loading, setLoading] = useState(true);
+
   const [vendor, setVendor] = useState<VendorInfo | null>(null);
   const [vendorEmail, setVendorEmail] = useState<string | null>(null);
 
   const [alertDays, setAlertDays] = useState<number>(180);
-  const [expiring, setExpiring] = useState<ExpiringRow[]>([]);
-  const [productStats, setProductStats] = useState({
-    total: 0,
-    published: 0,
-    lowStock: 0,
-    outOfStock: 0,
-    expiringCount: 0,
-    expiredCount: 0,
+
+  // New: unit-based stats
+  const [unitStats, setUnitStats] = useState({
+    productsWithUnits: 0,
+    totalUnits: 0,
+    inStockUnits: 0,
+    lowStockProducts: 0,
+    outOfStockProducts: 0,
+    expiringUnits: 0,
+    expiredUnits: 0,
   });
+
+  // New: expiring UNITS list (not products)
+  const [expiringUnits, setExpiringUnits] = useState<ExpiringUnitRow[]>([]);
 
   useEffect(() => {
     let cancelled = false;
+
     (async () => {
-      const {
-        data: { session },
-      } = await supabase.auth.getSession();
+      const { data: { session } } = await supabase.auth.getSession();
 
       if (!session?.user) {
         setHydrated(true);
@@ -148,9 +169,7 @@ export default function VendorDashboard() {
       setLoading(false);
     })();
 
-    const { data: sub } = supabase.auth.onAuthStateChange(() => {
-      setHydrated(true);
-    });
+    const { data: sub } = supabase.auth.onAuthStateChange(() => setHydrated(true));
 
     return () => {
       cancelled = true;
@@ -158,7 +177,7 @@ export default function VendorDashboard() {
     };
   }, [router]);
 
-  // Load alert window + expiring products + compute stats
+  // ✅ Unit-based alerts & stats
   useEffect(() => {
     if (!vendor?.id || vendor.status !== "approved") return;
 
@@ -174,78 +193,143 @@ export default function VendorDashboard() {
       const windowDays = Number.isFinite(d) && d > 0 ? d : 180;
       setAlertDays(windowDays);
 
-      // expiring list (ONLY within window)
-      const end = toYmd(new Date(Date.now() + windowDays * 86400000));
-      const { data: prod, error: pErr } = await supabase
+      const todayYmd = toYmd(new Date());
+      const endYmd = toYmd(new Date(Date.now() + windowDays * 86400000));
+
+      // Fetch products (id/name/slug)
+      const { data: products, error: pErr } = await supabase
         .from("products")
-        .select("id,name,slug,expiry_date,stock_qty,is_published,track_inventory")
+        .select("id,name,slug")
         .eq("vendor_id", vendor.id)
-        .not("expiry_date", "is", null)
-        .lte("expiry_date", end)
-        .order("expiry_date", { ascending: true })
-        .limit(25);
+        .limit(5000);
 
       if (pErr) {
         console.error(pErr);
-        setExpiring([]);
-      } else {
-        const list = (prod ?? []).map((p: any) => {
-          const ymd = String(p.expiry_date).slice(0, 10);
-          const dl = daysLeftFromYmd(ymd);
-          return {
-            id: p.id,
-            name: p.name,
-            slug: p.slug,
-            expiry_date: ymd,
-            stock_qty: Number(p.stock_qty ?? 0),
-            days_left: dl,
-          } as ExpiringRow;
-        });
-        setExpiring(list);
+        toast.error(pErr.message || "Failed to load products");
+        return;
       }
 
-      // product stats
-      const { data: allProd } = await supabase
-        .from("products")
-        .select("id,is_published,track_inventory,stock_qty,expiry_date")
-        .eq("vendor_id", vendor.id);
+      const productMap = new Map<string, { name: string; slug: string }>();
+      for (const p of (products ?? []) as any[]) {
+        productMap.set(p.id, { name: p.name, slug: p.slug });
+      }
 
-      const todayYmd = toYmd(new Date());
-      const endYmd = end;
+      // Fetch units (expiry_date based)
+      // NOTE: If your DB uses exp_date, change "expiry_date" below to "exp_date"
+      const { data: units, error: uErr } = await supabase
+        .from("inventory_units")
+        .select("id,product_id,unit_code,status,expiry_date")
+        .eq("vendor_id", vendor.id)
+        .limit(20000);
 
-      let total = 0;
-      let published = 0;
-      let lowStock = 0;
-      let outOfStock = 0;
-      let expiringCount = 0;
-      let expiredCount = 0;
+      if (uErr) {
+        console.error(uErr);
+        toast.error(uErr.message || "Failed to load units");
+        return;
+      }
 
-      for (const p of (allProd ?? []) as any[]) {
-        total += 1;
-        if (p.is_published) published += 1;
+      const relevantExpiryStatus = new Set(["IN_STOCK", "INVOICED", "DEMO"]);
+      const expList: ExpiringUnitRow[] = [];
 
-        const tracking = p.track_inventory ?? true;
-        const qty = Number(p.stock_qty ?? 0);
+      // per-product counts
+      const agg = new Map<string, ProductUnitAgg>();
 
-        if (tracking) {
-          if (qty === 0) outOfStock += 1;
-          else if (qty > 0 && qty <= 5) lowStock += 1;
+      for (const u of (units ?? []) as any[]) {
+        const productId = String(u.product_id);
+        const prod = productMap.get(productId);
+        if (!prod) continue;
+
+        if (!agg.has(productId)) {
+          agg.set(productId, {
+            product_id: productId,
+            product_name: prod.name,
+            product_slug: prod.slug,
+            in_stock: 0,
+            invoiced: 0,
+            demo: 0,
+            sold: 0,
+            returned: 0,
+            total: 0,
+            next_expiry_date: null,
+            next_expiry_days_left: null,
+          });
         }
 
-        const exp = p.expiry_date ? String(p.expiry_date).slice(0, 10) : null;
-        if (exp) {
-          if (exp < todayYmd) expiredCount += 1;
-          else if (exp >= todayYmd && exp <= endYmd) expiringCount += 1;
+        const a = agg.get(productId)!;
+
+        a.total += 1;
+        const st = String(u.status || "IN_STOCK");
+        if (st === "IN_STOCK") a.in_stock += 1;
+        else if (st === "INVOICED") a.invoiced += 1;
+        else if (st === "DEMO") a.demo += 1;
+        else if (st === "SOLD") a.sold += 1;
+        else if (st === "RETURNED") a.returned += 1;
+
+        const exp = u.expiry_date ? String(u.expiry_date).slice(0, 10) : null;
+        if (!exp) continue;
+
+        const dl = daysLeftFromYmd(exp);
+
+        // next expiry only from IN_STOCK/INVOICED/DEMO
+        if (relevantExpiryStatus.has(st)) {
+          if (!a.next_expiry_date || exp < a.next_expiry_date) {
+            a.next_expiry_date = exp;
+            a.next_expiry_days_left = dl;
+          }
+
+          // build expiring list within window + also include expired
+          if (exp <= endYmd) {
+            expList.push({
+              unit_id: String(u.id),
+              unit_code: String(u.unit_code),
+              product_id: productId,
+              product_name: prod.name,
+              product_slug: prod.slug,
+              expiry_date: exp,
+              days_left: dl,
+              status: st as any,
+            });
+          }
         }
       }
 
-      setProductStats({
-        total,
-        published,
-        lowStock,
-        outOfStock,
-        expiringCount,
-        expiredCount,
+      // Sort expiring: earliest expiry first
+      expList.sort((a, b) => a.expiry_date.localeCompare(b.expiry_date));
+      setExpiringUnits(expList.slice(0, 25));
+
+      // stats
+      let totalUnits = 0;
+      let inStockUnits = 0;
+      let expiredUnits = 0;
+      let expiringUnitsCount = 0;
+
+      const lowStockThreshold = 5;
+      let lowStockProducts = 0;
+      let outOfStockProducts = 0;
+
+      for (const a of agg.values()) {
+        totalUnits += a.total;
+        inStockUnits += a.in_stock;
+
+        // product-level stock flags
+        if (a.in_stock === 0) outOfStockProducts += 1;
+        else if (a.in_stock > 0 && a.in_stock <= lowStockThreshold) lowStockProducts += 1;
+      }
+
+      // unit-level expiry counts (IN_STOCK/INVOICED/DEMO only)
+      for (const e of expList) {
+        if (e.expiry_date < todayYmd) expiredUnits += 1;
+        else expiringUnitsCount += 1; // within window
+      }
+
+      setUnitStats({
+        productsWithUnits: agg.size,
+        totalUnits,
+        inStockUnits,
+        lowStockProducts,
+        outOfStockProducts,
+        expiringUnits: expiringUnitsCount,
+        expiredUnits,
       });
     })();
   }, [vendor?.id, vendor?.status]);
@@ -258,7 +342,6 @@ export default function VendorDashboard() {
     return null;
   };
 
-  // ✅ FIXED LOGOUT
   const handleLogout = async () => {
     const { error } = await supabase.auth.signOut();
     if (error) {
@@ -335,9 +418,7 @@ export default function VendorDashboard() {
               {vendor.status === "rejected" ? "Application Rejected" : "Account Disabled"}
             </CardTitle>
             <CardDescription>
-              {vendor.rejected_reason
-                ? `Reason: ${vendor.rejected_reason}`
-                : "Please contact support."}
+              {vendor.rejected_reason ? `Reason: ${vendor.rejected_reason}` : "Please contact support."}
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-3">
@@ -378,22 +459,22 @@ export default function VendorDashboard() {
         <div>
           <h2 className="text-3xl font-bold mb-2">Dashboard</h2>
           <p className="text-muted-foreground">
-            Expiry window: <b>{alertDays}</b> days
+            Expiry window: <b>{alertDays}</b> days (based on unit expiry)
           </p>
         </div>
 
-        {/* Summary cards */}
+        {/* Summary cards (UNIT SYSTEM) */}
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
           <Card>
             <CardHeader className="pb-3">
               <CardTitle className="text-sm font-medium text-muted-foreground">
-                Products (Total)
+                Products (with Units)
               </CardTitle>
             </CardHeader>
             <CardContent>
-              <div className="text-3xl font-bold">{productStats.total}</div>
+              <div className="text-3xl font-bold">{unitStats.productsWithUnits}</div>
               <p className="text-xs text-muted-foreground mt-1">
-                Published: {productStats.published}
+                Total units: {unitStats.totalUnits}
               </p>
             </CardContent>
           </Card>
@@ -401,15 +482,15 @@ export default function VendorDashboard() {
           <Card>
             <CardHeader className="pb-3">
               <CardTitle className="text-sm font-medium text-muted-foreground">
-                Stock Alerts
+                Stock Status
               </CardTitle>
             </CardHeader>
             <CardContent>
               <div className="text-3xl font-bold">
-                {productStats.outOfStock + productStats.lowStock}
+                {unitStats.outOfStockProducts + unitStats.lowStockProducts}
               </div>
               <p className="text-xs text-muted-foreground mt-1">
-                Out: {productStats.outOfStock} • Low: {productStats.lowStock}
+                Out: {unitStats.outOfStockProducts} • Low: {unitStats.lowStockProducts}
               </p>
             </CardContent>
           </Card>
@@ -417,11 +498,11 @@ export default function VendorDashboard() {
           <Card>
             <CardHeader className="pb-3">
               <CardTitle className="text-sm font-medium text-muted-foreground">
-                Expiring Soon
+                Expiring Units
               </CardTitle>
             </CardHeader>
             <CardContent>
-              <div className="text-3xl font-bold">{productStats.expiringCount}</div>
+              <div className="text-3xl font-bold">{unitStats.expiringUnits}</div>
               <p className="text-xs text-muted-foreground mt-1">
                 Within {alertDays} days
               </p>
@@ -431,11 +512,11 @@ export default function VendorDashboard() {
           <Card>
             <CardHeader className="pb-3">
               <CardTitle className="text-sm font-medium text-muted-foreground">
-                Expired
+                Expired Units
               </CardTitle>
             </CardHeader>
             <CardContent>
-              <div className="text-3xl font-bold">{productStats.expiredCount}</div>
+              <div className="text-3xl font-bold">{unitStats.expiredUnits}</div>
               <p className="text-xs text-muted-foreground mt-1">
                 Already expired
               </p>
@@ -443,50 +524,49 @@ export default function VendorDashboard() {
           </Card>
         </div>
 
-        {/* Expiry list */}
+        {/* Expiring UNITS list */}
         <Card>
           <CardHeader>
-            <CardTitle>Expiry Alerts</CardTitle>
+            <CardTitle>Unit Expiry Alerts</CardTitle>
             <CardDescription>
-              Products expiring within the next {alertDays} days (includes already expired).
+              Units expiring within the next {alertDays} days (includes already expired). Sorted by expiry date.
             </CardDescription>
           </CardHeader>
+
           <CardContent className="space-y-2">
-            {expiring.length === 0 ? (
+            {expiringUnits.length === 0 ? (
               <div className="text-sm text-muted-foreground">
-                No products expiring within the alert window.
+                No units expiring within the alert window.
               </div>
             ) : (
-              expiring.map((p) => (
+              expiringUnits.map((u) => (
                 <div
-                  key={p.id}
+                  key={u.unit_id}
                   className="flex items-center justify-between border rounded-md p-3"
                 >
-                  <div>
-                    <div className="font-medium">{p.name}</div>
+                  <div className="min-w-0">
+                    <div className="font-medium truncate">{u.product_name}</div>
                     <div className="text-xs text-muted-foreground">
-                      Expiry: {p.expiry_date} • Stock: {p.stock_qty}
+                      Unit: <span className="font-mono">{u.unit_code}</span> • Status: {u.status}
+                    </div>
+                    <div className="text-xs text-muted-foreground">
+                      Expiry: {u.expiry_date}
                     </div>
                   </div>
 
                   <div className="flex items-center gap-2">
                     <span
-                      className={`text-xs px-2 py-1 rounded ${expiryClass(
-                        p.days_left,
-                        alertDays
-                      )}`}
+                      className={`text-xs px-2 py-1 rounded ${expiryClass(u.days_left, alertDays)}`}
                     >
-                      {p.days_left < 0
-                        ? `${Math.abs(p.days_left)}d expired`
-                        : `${p.days_left}d left`}
+                      {u.days_left < 0 ? `${Math.abs(u.days_left)}d expired` : `${u.days_left}d left`}
                     </span>
 
                     <Button
                       size="sm"
                       variant="outline"
-                      onClick={() => router.push(`/vendor/products/${p.id}`)}
+                      onClick={() => router.push(`/vendor/products/${u.product_id}/units`)}
                     >
-                      Open
+                      Open Units
                     </Button>
                   </div>
                 </div>
@@ -505,7 +585,7 @@ export default function VendorDashboard() {
             </CardHeader>
             <CardContent>
               <p className="text-sm text-muted-foreground mb-4">
-                Add new products, update inventory, and manage pricing.
+                Add new products, update details, and manage pricing.
               </p>
               <Button
                 variant="outline"
@@ -565,7 +645,7 @@ export default function VendorDashboard() {
             </CardHeader>
             <CardContent>
               <p className="text-sm text-muted-foreground mb-4">
-                View low stock, out of stock, and expiry alerts.
+                View stock by units and upcoming unit expiry.
               </p>
               <Button
                 variant="outline"

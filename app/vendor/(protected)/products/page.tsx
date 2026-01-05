@@ -22,7 +22,7 @@ import {
 } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
 import { Switch } from "@/components/ui/switch";
-import { Plus, Edit, Trash2, Search, RefreshCcw } from "lucide-react";
+import { Plus, Edit, Trash2, Search, RefreshCcw, QrCode } from "lucide-react";
 import { toast } from "sonner";
 
 type VendorInfo = {
@@ -41,11 +41,13 @@ type ProductRow = {
   updated_at: string;
   vendor_id: string | null;
   brands?: { name?: string | null } | null;
+};
 
-  track_inventory?: boolean | null;
-  stock_qty?: number | null;
-
-  expiry_date?: string | null; // date
+type UnitSummary = {
+  total: number;
+  byStatus: Record<string, number>;
+  expiredCount: number;
+  expiringSoonCount: number;
 };
 
 const supabase = createClient(
@@ -81,13 +83,10 @@ function toYmd(d: Date) {
   return x.toISOString().slice(0, 10);
 }
 
-function daysLeftFromYmd(ymd?: string | null) {
-  if (!ymd) return null;
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  const exp = new Date(ymd);
-  exp.setHours(0, 0, 0, 0);
-  return Math.round((exp.getTime() - today.getTime()) / 86400000);
+function addDaysYmd(baseYmd: string, days: number) {
+  const d = new Date(baseYmd);
+  d.setDate(d.getDate() + days);
+  return toYmd(d);
 }
 
 function expiryPillClass(daysLeft: number, alertDays: number) {
@@ -98,7 +97,10 @@ function expiryPillClass(daysLeft: number, alertDays: number) {
   return "bg-muted text-foreground";
 }
 
-function useDebouncedCallback<T extends (...args: any[]) => void>(fn: T, delay = 500) {
+function useDebouncedCallback<T extends (...args: any[]) => void>(
+  fn: T,
+  delay = 500
+) {
   const fnRef = useRef(fn);
   useEffect(() => {
     fnRef.current = fn;
@@ -119,16 +121,32 @@ export default function VendorProductsPage() {
 
   const [search, setSearch] = useState("");
   const [rows, setRows] = useState<ProductRow[]>([]);
+  const [unitSummary, setUnitSummary] = useState<Record<string, UnitSummary>>(
+    {}
+  );
+
   const [loading, setLoading] = useState(true);
   const [paging, setPaging] = useState({ from: 0, to: 19, more: false });
   const [refreshKey, setRefreshKey] = useState(0);
 
   const [alertDays, setAlertDays] = useState<number>(180);
 
+  // treat low stock based on IN_STOCK units
+  const lowStockThreshold = 5;
+
+  const todayYmd = useMemo(() => toYmd(new Date()), []);
+  const endYmd = useMemo(
+    () => addDaysYmd(todayYmd, alertDays),
+    [todayYmd, alertDays]
+  );
+
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      const { data: { session } } = await supabase.auth.getSession();
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+
       if (!session?.user) {
         setHydrated(true);
         router.replace("/vendor/login");
@@ -178,10 +196,70 @@ export default function VendorProductsPage() {
         .select("expiry_alert_days")
         .eq("id", vendor.id)
         .maybeSingle();
+
       const d = Number((data as any)?.expiry_alert_days ?? 180);
       setAlertDays(Number.isFinite(d) && d > 0 ? d : 180);
     })();
   }, [vendor?.id]);
+
+  /**
+   * ✅ Units summary by product, based purely on inventory_units
+   * - total count
+   * - byStatus count
+   * - expired count (expiry_date < today)
+   * - expiring soon count (today <= expiry_date <= today+alertDays)
+   */
+  const fetchUnitSummaryForProducts = async (productIds: string[]) => {
+    if (!vendor?.id) return;
+    const missing = productIds.filter((id) => !unitSummary[id]);
+    if (missing.length === 0) return;
+
+    const { data, error } = await supabase
+      .from("inventory_units")
+      .select("product_id,status,expiry_date")
+      .eq("vendor_id", vendor.id)
+      .in("product_id", missing);
+
+    if (error) {
+      console.warn("unit summary fetch error", error);
+      return;
+    }
+
+    const next: Record<string, UnitSummary> = {};
+    for (const pid of missing) {
+      next[pid] = {
+        total: 0,
+        byStatus: {},
+        expiredCount: 0,
+        expiringSoonCount: 0,
+      };
+    }
+
+    for (const row of (data ?? []) as any[]) {
+      const pid = String(row.product_id);
+      const st = String(row.status || "IN_STOCK");
+      const exp = row.expiry_date ? String(row.expiry_date).slice(0, 10) : null;
+
+      if (!next[pid])
+        next[pid] = {
+          total: 0,
+          byStatus: {},
+          expiredCount: 0,
+          expiringSoonCount: 0,
+        };
+
+      next[pid].total += 1;
+      next[pid].byStatus[st] = (next[pid].byStatus[st] || 0) + 1;
+
+      if (exp) {
+        if (exp < todayYmd) next[pid].expiredCount += 1;
+        else if (exp >= todayYmd && exp <= endYmd)
+          next[pid].expiringSoonCount += 1;
+      }
+    }
+
+    setUnitSummary((prev) => ({ ...prev, ...next }));
+  };
 
   const loadPage = async (reset = false) => {
     if (!vendor) return;
@@ -195,9 +273,7 @@ export default function VendorProductsPage() {
       .select(
         `
         id, slug, name, price, currency, is_published, updated_at, vendor_id,
-        brands ( name ),
-        track_inventory, stock_qty,
-        expiry_date
+        brands ( name )
       `
       )
       .eq("vendor_id", vendor.id)
@@ -210,7 +286,9 @@ export default function VendorProductsPage() {
       setPaging({ from: 0, to: 19, more: false });
     } else {
       const got = (data ?? []) as ProductRow[];
+      if (reset) setUnitSummary({});
       setRows((prev) => (reset ? got : from === 0 ? got : [...prev, ...got]));
+      fetchUnitSummaryForProducts(got.map((p) => p.id));
       const more = got.length >= to - from + 1;
       setPaging({
         from: reset ? 20 : to + 1,
@@ -226,7 +304,7 @@ export default function VendorProductsPage() {
     if (!ready || !vendor) return;
     loadPage(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ready, vendor, refreshKey]);
+  }, [ready, vendor, refreshKey, alertDays]);
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -277,53 +355,8 @@ export default function VendorProductsPage() {
     }
   };
 
-  const toggleTrack = async (id: string, next: boolean) => {
-    const old = rows.find((r) => r.id === id)?.track_inventory ?? true;
-
-    // IMPORTANT: functional update (fixes random disable)
-    setRows((prev) =>
-      prev.map((r) => (r.id === id ? { ...r, track_inventory: next } : r))
-    );
-
-    const { error } = await supabase
-      .from("products")
-      .update({ track_inventory: next })
-      .eq("id", id);
-
-    if (error) {
-      toast.error(error.message || "Failed to update inventory tracking");
-      setRows((prev) =>
-        prev.map((r) => (r.id === id ? { ...r, track_inventory: old } : r))
-      );
-    } else {
-      toast.success(next ? "Tracking enabled" : "Tracking disabled");
-    }
-  };
-
-  // Debounced DB write only (local state is updated immediately in onChange)
-  const _saveStock = async (id: string, qty: number) => {
-    const { error } = await supabase
-      .from("products")
-      .update({ stock_qty: qty })
-      .eq("id", id);
-    if (error) {
-      toast.error(error.message || "Failed to update stock");
-      setRefreshKey((k) => k + 1);
-    }
-  };
-  const saveStock = useDebouncedCallback(_saveStock, 500);
-
-  const _saveExpiry = async (id: string, ymd: string | null) => {
-    const { error } = await supabase
-      .from("products")
-      .update({ expiry_date: ymd })
-      .eq("id", id);
-    if (error) {
-      toast.error(error.message || "Failed to update expiry date");
-      setRefreshKey((k) => k + 1);
-    }
-  };
-  const saveExpiry = useDebouncedCallback(_saveExpiry, 500);
+  // Debounced refresh (for search -> if you want later; currently local filter only)
+  const refresh = useDebouncedCallback(() => setRefreshKey((k) => k + 1), 250);
 
   if (!hydrated || !ready) {
     return (
@@ -344,6 +377,7 @@ export default function VendorProductsPage() {
             <h1 className="text-2xl font-bold">Product Management</h1>
             <Badge>Vendor: {vendor?.display_name}</Badge>
           </div>
+
           <div className="flex items-center gap-2">
             <Button
               variant="outline"
@@ -358,6 +392,7 @@ export default function VendorProductsPage() {
               <Plus className="mr-2 h-4 w-4" />
               Add Single Product
             </Button>
+
             <Button onClick={() => router.push("/vendor/products/new")}>
               <Plus className="mr-2 h-4 w-4" />
               Add Bulk Product
@@ -374,23 +409,27 @@ export default function VendorProductsPage() {
                 <div>
                   <CardTitle>Products</CardTitle>
                   <CardDescription>
-                    Manage inventory, expiry date, visibility and product details.
+                    Inventory is fully managed by Units (batch + unit status +
+                    expiry).
                   </CardDescription>
                 </div>
 
-                <div className="w-full md:w-[520px] flex items-center gap-3">
+                <div className="w-full md:w-[560px] flex items-center gap-3">
                   <div className="relative w-full">
                     <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
                     <Input
                       placeholder="Search products…"
                       value={search}
-                      onChange={(e) => setSearch(e.target.value)}
+                      onChange={(e) => {
+                        setSearch(e.target.value);
+                        refresh();
+                      }}
                       className="pl-10"
                     />
                   </div>
 
                   <div className="text-sm whitespace-nowrap">
-                    Expiry alert window: <b>{alertDays}</b> days
+                    Expiry window: <b>{alertDays}</b> days
                   </div>
                 </div>
               </div>
@@ -402,11 +441,15 @@ export default function VendorProductsPage() {
               <Table>
                 <TableHeader>
                   <TableRow>
-                    <TableHead className="min-w-[280px]">Product</TableHead>
+                    <TableHead className="min-w-[320px]">Product</TableHead>
                     <TableHead>Brand</TableHead>
-                    <TableHead>Price</TableHead>
-                    <TableHead className="min-w-[180px]">Stock</TableHead>
-                    <TableHead className="min-w-[220px]">Expiry</TableHead>
+                    <TableHead>MRP</TableHead>
+
+                    {/* ✅ Units-based stock/expiry summary */}
+                    <TableHead className="min-w-[300px]">
+                      Units Summary
+                    </TableHead>
+
                     <TableHead className="min-w-[180px]">Published</TableHead>
                     <TableHead>Updated</TableHead>
                     <TableHead className="text-right">Actions</TableHead>
@@ -417,7 +460,7 @@ export default function VendorProductsPage() {
                   {filtered.length === 0 ? (
                     <TableRow>
                       <TableCell
-                        colSpan={8}
+                        colSpan={7}
                         className="text-center text-muted-foreground py-10"
                       >
                         {loading ? "Loading…" : "No products found"}
@@ -425,11 +468,19 @@ export default function VendorProductsPage() {
                     </TableRow>
                   ) : (
                     filtered.map((p) => {
-                      const tracking = p.track_inventory ?? true;
-                      const stock = p.stock_qty ?? 0;
+                      const s = unitSummary[p.id];
+                      const total = s?.total ?? 0;
+                      const inStock = s?.byStatus?.IN_STOCK ?? 0;
+                      const invoiced = s?.byStatus?.INVOICED ?? 0;
+                      const demo = s?.byStatus?.DEMO ?? 0;
+                      const sold = s?.byStatus?.SOLD ?? 0;
+                      const returned = s?.byStatus?.RETURNED ?? 0;
 
-                      const expiry = p.expiry_date ? String(p.expiry_date).slice(0, 10) : "";
-                      const dl = daysLeftFromYmd(expiry);
+                      const expired = s?.expiredCount ?? 0;
+                      const expSoon = s?.expiringSoonCount ?? 0;
+
+                      const lowStock =
+                        inStock > 0 && inStock <= lowStockThreshold;
 
                       return (
                         <TableRow key={p.id}>
@@ -442,89 +493,70 @@ export default function VendorProductsPage() {
 
                           <TableCell>{p.brands?.name ?? "—"}</TableCell>
 
-                          <TableCell>{formatINR(p.price, p.currency)}</TableCell>
-
-                          {/* Stock */}
-                          <TableCell className="whitespace-nowrap">
-                            <div className="flex items-center gap-3">
-                              <div className="flex items-center gap-2">
-                                <Switch
-                                  checked={tracking}
-                                  onCheckedChange={(v) => toggleTrack(p.id, v)}
-                                  aria-label="Track inventory"
-                                />
-                                <span className="text-xs text-muted-foreground">
-                                  Track
-                                </span>
-                              </div>
-
-                              <Input
-                                type="number"
-                                min={0}
-                                value={stock}
-                                onChange={(e) => {
-                                  const v = Math.max(0, Number(e.target.value) || 0);
-                                  // local state first (stable)
-                                  setRows((prev) =>
-                                    prev.map((r) =>
-                                      r.id === p.id ? { ...r, stock_qty: v } : r
-                                    )
-                                  );
-                                  // debounced db write
-                                  saveStock(p.id, v);
-                                }}
-                                disabled={!tracking}
-                                className="h-8 w-24"
-                              />
-                            </div>
+                          <TableCell>
+                            {formatINR(p.price, p.currency)}
                           </TableCell>
 
-                          {/* Expiry */}
-                          <TableCell className="whitespace-nowrap">
-                            <div className="flex items-center gap-3">
-                              <Input
-                                type="date"
-                                value={expiry}
-                                onChange={(e) => {
-                                  const v = e.target.value || "";
-                                  setRows((prev) =>
-                                    prev.map((r) =>
-                                      r.id === p.id
-                                        ? { ...r, expiry_date: v || null }
-                                        : r
-                                    )
-                                  );
-                                  saveExpiry(p.id, v ? v : null);
-                                }}
-                                className="h-8 w-[165px]"
-                              />
+                          <TableCell>
+                            <div className="flex flex-wrap gap-2 items-center">
+                              <Badge variant="secondary">
+                                Total: <b className="ml-1">{total}</b>
+                              </Badge>
 
-                              <Button
-                                type="button"
-                                variant="outline"
-                                size="sm"
-                                className="h-8 px-3"
-                                onClick={() => {
-                                  setRows((prev) =>
-                                    prev.map((r) =>
-                                      r.id === p.id ? { ...r, expiry_date: null } : r
-                                    )
-                                  );
-                                  saveExpiry(p.id, null);
-                                }}
-                                title="Clear expiry"
+                              <Badge
+                                className={
+                                  lowStock ? "bg-orange-500 text-white" : ""
+                                }
                               >
-                                —
-                              </Button>
+                                In stock: <b className="ml-1">{inStock}</b>
+                              </Badge>
 
-                              {dl != null ? (
+                              <Badge variant="outline">
+                                Invoiced: <b className="ml-1">{invoiced}</b>
+                              </Badge>
+
+                              <Badge variant="outline">
+                                Demo: <b className="ml-1">{demo}</b>
+                              </Badge>
+
+                              <Badge variant="outline">
+                                Sold: <b className="ml-1">{sold}</b>
+                              </Badge>
+
+                              <Badge variant="outline">
+                                Returned: <b className="ml-1">{returned}</b>
+                              </Badge>
+
+                              {expired > 0 ? (
+                                <span className="text-xs px-2 py-1 rounded bg-red-600 text-white">
+                                  {expired} expired
+                                </span>
+                              ) : null}
+
+                              {expSoon > 0 ? (
                                 <span
-                                  className={`text-xs px-2 py-1 rounded ${expiryPillClass(dl, alertDays)}`}
+                                  className={`text-xs px-2 py-1 rounded ${expiryPillClass(
+                                    1,
+                                    alertDays
+                                  )}`}
+                                  title={`Expiring within ${alertDays} days`}
                                 >
-                                  {dl < 0 ? `${Math.abs(dl)}d expired` : `${dl}d left`}
+                                  {expSoon} expiring soon
+                                </span>
+                              ) : null}
+
+                              {total === 0 ? (
+                                <span className="text-xs text-muted-foreground">
+                                  No units added yet
                                 </span>
                               ) : null}
                             </div>
+
+                            {lowStock ? (
+                              <div className="mt-1 text-xs text-orange-600">
+                                Low stock (≤ {lowStockThreshold} in stock)
+                              </div>
+                            ) : null}
                           </TableCell>
 
                           {/* Published */}
@@ -535,18 +567,25 @@ export default function VendorProductsPage() {
                                 onCheckedChange={(v) => togglePublish(p.id, v)}
                                 aria-label="Publish / hide"
                               />
-                              <Badge variant={p.is_published ? "default" : "secondary"}>
+                              <Badge
+                                variant={
+                                  p.is_published ? "default" : "secondary"
+                                }
+                              >
                                 {p.is_published ? "Published" : "Hidden"}
                               </Badge>
                             </div>
                           </TableCell>
 
                           <TableCell className="whitespace-nowrap text-sm">
-                            {new Date(p.updated_at).toLocaleDateString("en-IN", {
-                              year: "numeric",
-                              month: "short",
-                              day: "numeric",
-                            })}
+                            {new Date(p.updated_at).toLocaleDateString(
+                              "en-IN",
+                              {
+                                year: "numeric",
+                                month: "short",
+                                day: "numeric",
+                              }
+                            )}
                           </TableCell>
 
                           <TableCell className="text-right">
@@ -554,11 +593,25 @@ export default function VendorProductsPage() {
                               <Button
                                 variant="ghost"
                                 size="sm"
-                                onClick={() => router.push(`/vendor/products/${p.id}`)}
+                                onClick={() =>
+                                  router.push(`/vendor/products/${p.id}/units`)
+                                }
+                                title="Manage Units"
+                              >
+                                <QrCode className="h-4 w-4" />
+                              </Button>
+
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                onClick={() =>
+                                  router.push(`/vendor/products/${p.id}`)
+                                }
                                 title="Edit"
                               >
                                 <Edit className="h-4 w-4" />
                               </Button>
+
                               <Button
                                 variant="ghost"
                                 size="sm"
