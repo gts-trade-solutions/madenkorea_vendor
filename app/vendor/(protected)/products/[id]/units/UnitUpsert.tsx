@@ -14,7 +14,21 @@ import {
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 
-type InventoryStatus = "IN_STOCK" | "INVOICED" | "SOLD" | "OUT_OF_STOCK";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+
+type InventoryStatus =
+  | "IN_STOCK"
+  | "INVOICED"
+  | "DEMO"
+  | "SOLD"
+  | "RETURNED"
+  | "OUT_OF_STOCK";
 
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -25,7 +39,7 @@ const supabase = createClient(
 function toYmd(d: Date) {
   const x = new Date(d);
   x.setHours(0, 0, 0, 0);
-  return x.toISOString().slice(0, 10); // YYYY-MM-DD
+  return x.toISOString().slice(0, 10);
 }
 
 function addYears(date: Date, years: number) {
@@ -39,13 +53,12 @@ function pad3(n: number) {
 }
 
 function ymdToCompact(ymd: string) {
-  return (ymd || "").replaceAll("-", ""); // YYYYMMDD
+  return (ymd || "").replaceAll("-", "");
 }
 
 function priceToCodePart(price: number) {
-  // avoid dot in unit code; convert to paise-like integer (2 decimals)
   if (!Number.isFinite(price)) return "";
-  return String(Math.round(price * 100));
+  return String(Math.round(price * 100)); // 2 decimals
 }
 
 function first2Letters(name: string) {
@@ -77,7 +90,6 @@ export function UnitUpsertDialog({
     manufacture_date?: string | null;
     expiry_date?: string | null;
     status: InventoryStatus;
-    price?: number | null;
   } | null;
   onSaved: () => void;
 }) {
@@ -85,38 +97,39 @@ export function UnitUpsertDialog({
   const [loadingMeta, setLoadingMeta] = useState(false);
   const [saving, setSaving] = useState(false);
 
-  // auto fetched
+  // meta fetched (create)
   const [productName, setProductName] = useState("");
   const [brandName, setBrandName] = useState("");
-
   const [productCode, setProductCode] = useState("");
   const [brandCode, setBrandCode] = useState("");
 
+  // form fields
+  const [unitCode, setUnitCode] = useState("");
   const [manufactureDate, setManufactureDate] = useState("");
   const [expiryDate, setExpiryDate] = useState("");
-  const [price, setPrice] = useState<number>(0);
-
-  // batch count
-  const [unitsCount, setUnitsCount] = useState<number>(1);
-
-  // edit fields
   const [editStatus, setEditStatus] = useState<InventoryStatus>("IN_STOCK");
+
+  // internal price (NOT editable) – used for unit_code generation + insert
+  const [salePrice, setSalePrice] = useState<number>(0);
+
+  // batch count (create)
+  const [unitsCount, setUnitsCount] = useState<number>(1);
 
   // Load on open
   useEffect(() => {
     if (!open) return;
 
-    // EDIT MODE: no regeneration; allow update of status/dates/price
+    // EDIT MODE
     if (isEdit && initial) {
+      setUnitCode(initial.unit_code ?? "");
       setManufactureDate((initial.manufacture_date ?? "") as string);
       setExpiryDate((initial.expiry_date ?? "") as string);
-      setPrice(Number(initial.price ?? 0));
-      setEditStatus(initial.status);
+      setEditStatus(initial.status ?? "IN_STOCK");
       setUnitsCount(1);
       return;
     }
 
-    // CREATE MODE: auto fill everything
+    // CREATE MODE
     (async () => {
       setLoadingMeta(true);
       try {
@@ -125,7 +138,7 @@ export function UnitUpsertDialog({
         setExpiryDate(toYmd(addYears(today, 2)));
         setUnitsCount(1);
 
-        // get product (need product_code + price + brand_id + name)
+        // product: MUST prefer sale_price
         const { data: p, error: pErr } = await supabase
           .from("products")
           .select("id,name,product_code,price,sale_price,brand_id")
@@ -137,19 +150,22 @@ export function UnitUpsertDialog({
         const pName = (p as any)?.name ?? "";
         setProductName(pName);
 
-        // if product_code missing, fallback to generated (for UI only)
         const pCode =
           (p as any)?.product_code?.toString()?.trim() ||
           `${first2Letters(pName)}${rand4()}`;
         setProductCode(pCode);
 
-        const pPrice =
-          (p as any)?.sale_price != null
-            ? Number((p as any).sale_price)
-            : Number((p as any)?.price ?? 0);
-        setPrice(Number.isFinite(pPrice) ? pPrice : 0);
+        const sp = (p as any)?.sale_price;
+        const pr = (p as any)?.price;
 
-        // brand fetch for brand_code
+        // Use sale_price (as requested). If missing, fallback to price but warn.
+        if (sp == null) {
+          toast.warning("sale_price is null for this product. Using price as fallback.");
+        }
+        const final = sp != null ? Number(sp) : Number(pr ?? 0);
+        setSalePrice(Number.isFinite(final) ? final : 0);
+
+        // brand
         const brandId = (p as any)?.brand_id;
         if (brandId) {
           const { data: b, error: bErr } = await supabase
@@ -168,7 +184,6 @@ export function UnitUpsertDialog({
             `${first2Letters(bName)}${rand4()}`;
           setBrandCode(bCode);
         } else {
-          // brand not linked
           setBrandName("");
           setBrandCode("XX" + rand4());
         }
@@ -181,14 +196,14 @@ export function UnitUpsertDialog({
     })();
   }, [open, isEdit, initial, productId]);
 
-  // base (batch) code = product_code&brand_code&mfg&exp&price
+  // base code for create (batch)
   const batchBaseCode = useMemo(() => {
     if (!productCode || !brandCode || !manufactureDate || !expiryDate) return "";
     const mfg = ymdToCompact(manufactureDate);
     const exp = ymdToCompact(expiryDate);
-    const pr = priceToCodePart(price);
+    const pr = priceToCodePart(salePrice); // uses SALE PRICE (not editable)
     return `${productCode}${brandCode}${mfg}${exp}${pr}`;
-  }, [productCode, brandCode, manufactureDate, expiryDate, price]);
+  }, [productCode, brandCode, manufactureDate, expiryDate, salePrice]);
 
   const previewCodes = useMemo(() => {
     if (!batchBaseCode) return [];
@@ -196,34 +211,26 @@ export function UnitUpsertDialog({
     return Array.from({ length: n }).map((_, i) => `${batchBaseCode}-${pad3(i + 1)}`);
   }, [batchBaseCode, unitsCount]);
 
+  // Create batch
   const createBatch = async () => {
     if (!vendorId || !productId) return;
 
     const count = Math.max(1, Math.floor(unitsCount || 1));
 
-    if (!batchBaseCode) {
-      toast.error("Unit code not ready. Please check dates/codes.");
-      return;
-    }
-    if (!manufactureDate) {
-      toast.error("Manufacture date is required.");
-      return;
-    }
-    if (!expiryDate) {
-      toast.error("Expiry date is required.");
-      return;
-    }
+    if (!batchBaseCode) return toast.error("Unit code not ready. Please check dates/codes.");
+    if (!manufactureDate) return toast.error("Manufacture date is required.");
+    if (!expiryDate) return toast.error("Expiry date is required.");
 
     setSaving(true);
     try {
-      // IMPORTANT: match your DB column names
       const rows = Array.from({ length: count }).map((_, i) => ({
         vendor_id: vendorId,
         product_id: productId,
         unit_code: `${batchBaseCode}-${pad3(i + 1)}`,
-        manufacture_date: manufactureDate, // NOT NULL in your DB
+        manufacture_date: manufactureDate,
         expiry_date: expiryDate,
-        price: price,
+        // keep price stored but NOT editable; set from sale_price
+        price: salePrice,
         status: "IN_STOCK" as InventoryStatus,
       }));
 
@@ -241,23 +248,40 @@ export function UnitUpsertDialog({
     }
   };
 
+  // Save edit (single)
   const saveEdit = async () => {
     if (!initial?.id) return;
 
-    if (!manufactureDate) {
-      toast.error("Manufacture date is required.");
-      return;
-    }
+    const nextUnitCode = unitCode.trim();
+
+    if (!nextUnitCode) return toast.error("Unit code is required.");
+    if (!manufactureDate) return toast.error("Manufacture date is required.");
 
     setSaving(true);
     try {
+      // Optional friendly duplicate check
+      if (nextUnitCode !== initial.unit_code) {
+        const { data: dup } = await supabase
+          .from("inventory_units")
+          .select("id")
+          .eq("vendor_id", vendorId)
+          .eq("unit_code", nextUnitCode)
+          .limit(1);
+
+        if (dup && dup.length > 0) {
+          toast.error("This unit code already exists. Please use a unique unit code.");
+          return;
+        }
+      }
+
       const { error } = await supabase
         .from("inventory_units")
         .update({
+          unit_code: nextUnitCode, // ✅ now editable
           manufacture_date: manufactureDate,
           expiry_date: expiryDate || null,
-          price: price,
           status: editStatus,
+          // ❌ no price update here
         })
         .eq("id", initial.id)
         .eq("vendor_id", vendorId);
@@ -286,7 +310,14 @@ export function UnitUpsertDialog({
           <div className="space-y-4">
             <div>
               <div className="text-sm font-medium mb-1">Unit code</div>
-              <Input value={initial?.unit_code ?? ""} readOnly />
+              <Input
+                value={unitCode}
+                onChange={(e) => setUnitCode(e.target.value)}
+                placeholder="Enter unit code"
+              />
+              <div className="text-xs text-muted-foreground mt-1">
+                Must be unique per vendor.
+              </div>
             </div>
 
             <div className="grid grid-cols-2 gap-3">
@@ -308,25 +339,24 @@ export function UnitUpsertDialog({
               </div>
             </div>
 
-            <div className="grid grid-cols-2 gap-3">
-              <div>
-                <div className="text-sm font-medium mb-1">Price</div>
-                <Input
-                  type="number"
-                  value={Number.isFinite(price) ? price : 0}
-                  onChange={(e) => setPrice(Number(e.target.value))}
-                  min="0"
-                />
-              </div>
-              <div>
-                <div className="text-sm font-medium mb-1">Status</div>
-                <Input
-                  value={editStatus}
-                  onChange={(e) => setEditStatus(e.target.value as InventoryStatus)}
-                  placeholder="IN_STOCK / INVOICED / SOLD / OUT_OF_STOCK"
-                />
-              </div>
+            <div>
+              <div className="text-sm font-medium mb-1">Status</div>
+              <Select value={editStatus} onValueChange={(v) => setEditStatus(v as InventoryStatus)}>
+                <SelectTrigger className="w-full">
+                  <SelectValue placeholder="Select status" />
+                </SelectTrigger>
+                <SelectContent className="bg-background">
+                  <SelectItem value="IN_STOCK">IN_STOCK</SelectItem>
+                  <SelectItem value="INVOICED">INVOICED</SelectItem>
+                  <SelectItem value="DEMO">DEMO</SelectItem>
+                  <SelectItem value="SOLD">SOLD</SelectItem>
+                  <SelectItem value="RETURNED">RETURNED</SelectItem>
+                  <SelectItem value="OUT_OF_STOCK">OUT_OF_STOCK</SelectItem>
+                </SelectContent>
+              </Select>
             </div>
+
+            {/* ✅ price removed from edit */}
           </div>
         ) : (
           <div className="space-y-4">
@@ -372,19 +402,16 @@ export function UnitUpsertDialog({
               </div>
             </div>
 
-            <div className="grid grid-cols-2 gap-3">
-              <div>
-                <div className="text-sm font-medium mb-1">Price (auto)</div>
-                <Input
-                  type="number"
-                  value={Number.isFinite(price) ? price : 0}
-                  onChange={(e) => setPrice(Number(e.target.value))}
-                  min="0"
-                />
-                <div className="text-xs text-muted-foreground mt-1">
-                  Auto from product (editable)
-                </div>
+            {/* ✅ price shown (read-only) but not editable */}
+            <div>
+              <div className="text-sm font-medium mb-1">Sale price (auto)</div>
+              <Input value={Number.isFinite(salePrice) ? String(salePrice) : "0"} readOnly />
+              <div className="text-xs text-muted-foreground mt-1">
+                Fetched from products.sale_price (fallback to price if missing).
               </div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3">
               <div>
                 <div className="text-sm font-medium mb-1">Units count (batch)</div>
                 <Input
@@ -393,17 +420,15 @@ export function UnitUpsertDialog({
                   onChange={(e) => setUnitsCount(Number(e.target.value))}
                   min="1"
                 />
-                <div className="text-xs text-muted-foreground mt-1">
-                  Example: 10
-                </div>
+                <div className="text-xs text-muted-foreground mt-1">Example: 10</div>
               </div>
-            </div>
 
-            <div>
-              <div className="text-sm font-medium mb-1">Batch Base Code (auto)</div>
-              <Input value={batchBaseCode} readOnly placeholder="Auto-generated" />
-              <div className="text-xs text-muted-foreground mt-1">
-                product_code&brand_code&manufacture_date&expiry_date&price
+              <div>
+                <div className="text-sm font-medium mb-1">Batch Base Code (auto)</div>
+                <Input value={batchBaseCode} readOnly placeholder="Auto-generated" />
+                <div className="text-xs text-muted-foreground mt-1">
+                  product_code + brand_code + mfg + exp + sale_price
+                </div>
               </div>
             </div>
 
@@ -433,10 +458,7 @@ export function UnitUpsertDialog({
               {saving ? "Saving…" : "Save"}
             </Button>
           ) : (
-            <Button
-              onClick={createBatch}
-              disabled={saving || loadingMeta || !batchBaseCode}
-            >
+            <Button onClick={createBatch} disabled={saving || loadingMeta || !batchBaseCode}>
               {saving ? "Creating…" : "Create units"}
             </Button>
           )}

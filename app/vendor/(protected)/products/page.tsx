@@ -3,6 +3,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { createClient } from "@supabase/supabase-js";
+import { toast } from "sonner";
+
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -22,8 +24,23 @@ import {
 } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
 import { Switch } from "@/components/ui/switch";
-import { Plus, Edit, Trash2, Search, RefreshCcw, QrCode } from "lucide-react";
-import { toast } from "sonner";
+import {
+  Plus,
+  Edit,
+  Trash2,
+  Search,
+  RefreshCcw,
+  QrCode,
+  X,
+} from "lucide-react";
+
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 
 type VendorInfo = {
   id: string;
@@ -35,13 +52,16 @@ type ProductRow = {
   id: string;
   slug: string;
   name: string;
-  price: number | null;
+  sale_price: number | null;
   currency: string | null;
   is_published: boolean;
   updated_at: string;
   vendor_id: string | null;
+  brand_id?: string | null;
   brands?: { name?: string | null } | null;
 };
+
+type BrandOption = { id: string; name: string };
 
 type UnitSummary = {
   total: number;
@@ -82,34 +102,19 @@ function toYmd(d: Date) {
   x.setHours(0, 0, 0, 0);
   return x.toISOString().slice(0, 10);
 }
-
 function addDaysYmd(baseYmd: string, days: number) {
   const d = new Date(baseYmd);
   d.setDate(d.getDate() + days);
   return toYmd(d);
 }
 
-function expiryPillClass(daysLeft: number, alertDays: number) {
-  if (daysLeft < 0) return "bg-red-600 text-white";
-  if (daysLeft <= 30) return "bg-red-500 text-white";
-  if (daysLeft <= 90) return "bg-orange-500 text-white";
-  if (daysLeft <= alertDays) return "bg-yellow-400 text-black";
-  return "bg-muted text-foreground";
-}
-
-function useDebouncedCallback<T extends (...args: any[]) => void>(
-  fn: T,
-  delay = 500
-) {
-  const fnRef = useRef(fn);
+function useDebouncedValue<T>(value: T, delay = 350) {
+  const [debounced, setDebounced] = useState(value);
   useEffect(() => {
-    fnRef.current = fn;
-  }, [fn]);
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  return (...args: Parameters<T>) => {
-    if (timerRef.current) clearTimeout(timerRef.current);
-    timerRef.current = setTimeout(() => fnRef.current(...args), delay);
-  };
+    const t = setTimeout(() => setDebounced(value), delay);
+    return () => clearTimeout(t);
+  }, [value, delay]);
+  return debounced;
 }
 
 export default function VendorProductsPage() {
@@ -119,29 +124,48 @@ export default function VendorProductsPage() {
   const [ready, setReady] = useState(false);
   const [vendor, setVendor] = useState<VendorInfo | null>(null);
 
+  // server-side search + filters
   const [search, setSearch] = useState("");
+  const debouncedSearch = useDebouncedValue(search, 350);
+
+  const [brandId, setBrandId] = useState<string | "ALL">("ALL");
+  const [published, setPublished] = useState<"ALL" | "PUBLISHED" | "HIDDEN">(
+    "ALL"
+  );
+  const [sort, setSort] = useState<"UPDATED_DESC" | "NAME_ASC">("UPDATED_DESC");
+
+  // pagination
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(20);
+  const [totalCount, setTotalCount] = useState(0);
+
   const [rows, setRows] = useState<ProductRow[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  // unit summary cache (per product id)
   const [unitSummary, setUnitSummary] = useState<Record<string, UnitSummary>>(
     {}
   );
 
-  const [loading, setLoading] = useState(true);
-  const [paging, setPaging] = useState({ from: 0, to: 19, more: false });
+  const [brands, setBrands] = useState<BrandOption[]>([]);
+
   const [refreshKey, setRefreshKey] = useState(0);
 
+  // expiry window
   const [alertDays, setAlertDays] = useState<number>(180);
-
-  // treat low stock based on IN_STOCK units
-  const lowStockThreshold = 5;
-
   const todayYmd = useMemo(() => toYmd(new Date()), []);
   const endYmd = useMemo(
     () => addDaysYmd(todayYmd, alertDays),
     [todayYmd, alertDays]
   );
 
+  // low stock flag based on IN_STOCK units
+  const lowStockThreshold = 5;
+
+  // ---------------- auth / vendor gate ----------------
   useEffect(() => {
     let cancelled = false;
+
     (async () => {
       const {
         data: { session },
@@ -183,11 +207,11 @@ export default function VendorProductsPage() {
 
     return () => {
       cancelled = true;
-      sub.subscription.unsubscribe();
+      sub?.subscription?.unsubscribe();
     };
   }, [router]);
 
-  // load vendor expiry_alert_days
+  // vendor expiry alert days
   useEffect(() => {
     if (!vendor?.id) return;
     (async () => {
@@ -202,15 +226,31 @@ export default function VendorProductsPage() {
     })();
   }, [vendor?.id]);
 
+  // load brand options (filter dropdown)
+  useEffect(() => {
+    if (!vendor?.id) return;
+    (async () => {
+      const { data, error } = await supabase
+        .from("brands")
+        .select("id,name")
+        .order("name", { ascending: true });
+
+      if (error) {
+        console.warn("brands load error", error);
+        setBrands([]);
+      } else {
+        setBrands(((data ?? []) as any[]).map((b) => ({ id: b.id, name: b.name })));
+      }
+    })();
+  }, [vendor?.id]);
+
   /**
-   * ✅ Units summary by product, based purely on inventory_units
-   * - total count
-   * - byStatus count
-   * - expired count (expiry_date < today)
-   * - expiring soon count (today <= expiry_date <= today+alertDays)
+   * Units summary for products (current page only).
+   * If your units table is huge, move this to an RPC/view with aggregates.
    */
   const fetchUnitSummaryForProducts = async (productIds: string[]) => {
     if (!vendor?.id) return;
+
     const missing = productIds.filter((id) => !unitSummary[id]);
     if (missing.length === 0) return;
 
@@ -227,12 +267,7 @@ export default function VendorProductsPage() {
 
     const next: Record<string, UnitSummary> = {};
     for (const pid of missing) {
-      next[pid] = {
-        total: 0,
-        byStatus: {},
-        expiredCount: 0,
-        expiringSoonCount: 0,
-      };
+      next[pid] = { total: 0, byStatus: {}, expiredCount: 0, expiringSoonCount: 0 };
     }
 
     for (const row of (data ?? []) as any[]) {
@@ -240,113 +275,141 @@ export default function VendorProductsPage() {
       const st = String(row.status || "IN_STOCK");
       const exp = row.expiry_date ? String(row.expiry_date).slice(0, 10) : null;
 
-      if (!next[pid])
-        next[pid] = {
-          total: 0,
-          byStatus: {},
-          expiredCount: 0,
-          expiringSoonCount: 0,
-        };
+      if (!next[pid]) {
+        next[pid] = { total: 0, byStatus: {}, expiredCount: 0, expiringSoonCount: 0 };
+      }
 
       next[pid].total += 1;
       next[pid].byStatus[st] = (next[pid].byStatus[st] || 0) + 1;
 
       if (exp) {
         if (exp < todayYmd) next[pid].expiredCount += 1;
-        else if (exp >= todayYmd && exp <= endYmd)
-          next[pid].expiringSoonCount += 1;
+        else if (exp >= todayYmd && exp <= endYmd) next[pid].expiringSoonCount += 1;
       }
     }
 
     setUnitSummary((prev) => ({ ...prev, ...next }));
   };
 
-  const loadPage = async (reset = false) => {
-    if (!vendor) return;
+  // ---------------- main fetch (server-side search/pagination) ----------------
+  const fetchProducts = async (opts?: { resetPage?: boolean; clearSummary?: boolean }) => {
+    if (!vendor?.id) return;
+
+    const resetPage = opts?.resetPage ?? false;
+    const clearSummary = opts?.clearSummary ?? false;
+
+    const targetPage = resetPage ? 1 : page;
+    const from = (targetPage - 1) * pageSize;
+    const to = from + pageSize - 1;
+
     setLoading(true);
+    try {
+      let q = supabase
+        .from("products")
+        .select(
+          `
+          id, slug, name, sale_price, currency, is_published, updated_at, vendor_id, brand_id,
+          brands ( name )
+        `,
+          { count: "exact" }
+        )
+        .eq("vendor_id", vendor.id);
 
-    const from = reset ? 0 : paging.from;
-    const to = reset ? 19 : paging.to;
+      const s = debouncedSearch.trim();
+      if (s) {
+        // name OR slug search (fast + stable)
+        q = q.or(`name.ilike.%${s}%,slug.ilike.%${s}%`);
+        // If you want brand-name search in DB too, we can do it with an inner join,
+        // but it's a bit finicky in PostgREST; keep it simple for now.
+      }
 
-    const { data, error } = await supabase
-      .from("products")
-      .select(
-        `
-        id, slug, name, price, currency, is_published, updated_at, vendor_id,
-        brands ( name )
-      `
-      )
-      .eq("vendor_id", vendor.id)
-      .order("updated_at", { ascending: false })
-      .range(from, to);
+      if (brandId !== "ALL") {
+        q = q.eq("brand_id", brandId);
+      }
 
-    if (error) {
-      toast.error(error.message || "Failed to load products");
-      setRows([]);
-      setPaging({ from: 0, to: 19, more: false });
-    } else {
+      if (published !== "ALL") {
+        q = q.eq("is_published", published === "PUBLISHED");
+      }
+
+      if (sort === "UPDATED_DESC") {
+        q = q.order("updated_at", { ascending: false });
+      } else {
+        q = q.order("name", { ascending: true });
+      }
+
+      const { data, error, count } = await q.range(from, to);
+
+      if (error) {
+        toast.error(error.message || "Failed to load products");
+        setRows([]);
+        setTotalCount(0);
+        return;
+      }
+
+      if (clearSummary) setUnitSummary({});
       const got = (data ?? []) as ProductRow[];
-      if (reset) setUnitSummary({});
-      setRows((prev) => (reset ? got : from === 0 ? got : [...prev, ...got]));
-      fetchUnitSummaryForProducts(got.map((p) => p.id));
-      const more = got.length >= to - from + 1;
-      setPaging({
-        from: reset ? 20 : to + 1,
-        to: reset ? 39 : to + 20,
-        more,
-      });
-    }
+      setRows(got);
+      setTotalCount(count ?? 0);
 
-    setLoading(false);
+      // Fetch unit summary for just this page’s products
+      fetchUnitSummaryForProducts(got.map((p) => p.id));
+
+      if (resetPage) setPage(1);
+    } finally {
+      setLoading(false);
+    }
   };
 
+  // first load + refresh + filters/search/page changes
   useEffect(() => {
-    if (!ready || !vendor) return;
-    loadPage(true);
+    if (!ready || !vendor?.id) return;
+    fetchProducts({ resetPage: false, clearSummary: false });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ready, vendor, refreshKey, alertDays]);
+  }, [ready, vendor?.id, page, pageSize, debouncedSearch, brandId, published, sort, refreshKey, alertDays]);
 
-  const filtered = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    if (!q) return rows;
-    return rows.filter(
-      (r) =>
-        r.name.toLowerCase().includes(q) ||
-        r.slug.toLowerCase().includes(q) ||
-        (r.brands?.name || "").toLowerCase().includes(q)
-    );
-  }, [rows, search]);
+  const totalPages = Math.max(1, Math.ceil((totalCount || 0) / pageSize));
+
+  const clearFilters = () => {
+    setSearch("");
+    setBrandId("ALL");
+    setPublished("ALL");
+    setSort("UPDATED_DESC");
+    setPage(1);
+    setUnitSummary({});
+    setRefreshKey((k) => k + 1);
+  };
 
   const onDelete = async (id: string) => {
     const yes = window.confirm("Delete this product? This cannot be undone.");
     if (!yes) return;
+
     const { error } = await supabase.from("products").delete().eq("id", id);
     if (error) {
       toast.error(error.message || "Delete failed");
       return;
     }
+
     toast.success("Product deleted");
-    setRows((prev) => prev.filter((r) => r.id !== id));
+    // Refresh current page
+    setUnitSummary((prev) => {
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+    setRefreshKey((k) => k + 1);
   };
 
   const togglePublish = async (id: string, next: boolean) => {
     const old = rows.find((r) => r.id === id)?.is_published;
 
-    setRows((prev) =>
-      prev.map((r) => (r.id === id ? { ...r, is_published: next } : r))
-    );
+    setRows((prev) => prev.map((r) => (r.id === id ? { ...r, is_published: next } : r)));
 
-    const { error } = await supabase
-      .from("products")
-      .update({ is_published: next })
-      .eq("id", id);
+    const { error } = await supabase.from("products").update({ is_published: next }).eq("id", id);
 
     if (error) {
       toast.error(error.message || "Failed to update visibility");
       if (typeof old === "boolean") {
-        setRows((prev) =>
-          prev.map((r) => (r.id === id ? { ...r, is_published: old } : r))
-        );
+        setRows((prev) => prev.map((r) => (r.id === id ? { ...r, is_published: old } : r)));
       } else {
         setRefreshKey((k) => k + 1);
       }
@@ -354,9 +417,6 @@ export default function VendorProductsPage() {
       toast.success(next ? "Product published" : "Product hidden");
     }
   };
-
-  // Debounced refresh (for search -> if you want later; currently local filter only)
-  const refresh = useDebouncedCallback(() => setRefreshKey((k) => k + 1), 250);
 
   if (!hydrated || !ready) {
     return (
@@ -379,11 +439,7 @@ export default function VendorProductsPage() {
           </div>
 
           <div className="flex items-center gap-2">
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setRefreshKey((k) => k + 1)}
-            >
+            <Button variant="outline" size="sm" onClick={() => setRefreshKey((k) => k + 1)}>
               <RefreshCcw className="h-4 w-4 mr-2" />
               Refresh
             </Button>
@@ -409,28 +465,137 @@ export default function VendorProductsPage() {
                 <div>
                   <CardTitle>Products</CardTitle>
                   <CardDescription>
-                    Inventory is fully managed by Units (batch + unit status +
-                    expiry).
+                    Inventory is fully managed by Units (batch + unit status + expiry).
                   </CardDescription>
                 </div>
 
-                <div className="w-full md:w-[560px] flex items-center gap-3">
+                <div className="w-full md:w-[760px] flex flex-col md:flex-row md:items-center gap-3">
+                  {/* Search */}
                   <div className="relative w-full">
                     <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
                     <Input
-                      placeholder="Search products…"
+                      placeholder="Search by product name or slug…"
                       value={search}
                       onChange={(e) => {
                         setSearch(e.target.value);
-                        refresh();
+                        setPage(1);
+                        setUnitSummary({});
                       }}
                       className="pl-10"
                     />
                   </div>
 
-                  <div className="text-sm whitespace-nowrap">
-                    Expiry window: <b>{alertDays}</b> days
-                  </div>
+                  {/* Brand filter */}
+                  <Select
+                    value={brandId}
+                    onValueChange={(v) => {
+                      setBrandId(v as any);
+                      setPage(1);
+                      setUnitSummary({});
+                    }}
+                  >
+                    <SelectTrigger className="w-full md:w-[220px]">
+                      <SelectValue placeholder="Brand" />
+                    </SelectTrigger>
+                    <SelectContent className="bg-background">
+                      <SelectItem value="ALL">All brands</SelectItem>
+                      {brands.map((b) => (
+                        <SelectItem key={b.id} value={b.id}>
+                          {b.name}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+
+                  {/* Published filter */}
+                  <Select
+                    value={published}
+                    onValueChange={(v) => {
+                      setPublished(v as any);
+                      setPage(1);
+                      setUnitSummary({});
+                    }}
+                  >
+                    <SelectTrigger className="w-full md:w-[180px]">
+                      <SelectValue placeholder="Visibility" />
+                    </SelectTrigger>
+                    <SelectContent className="bg-background">
+                      <SelectItem value="ALL">All</SelectItem>
+                      <SelectItem value="PUBLISHED">Published</SelectItem>
+                      <SelectItem value="HIDDEN">Hidden</SelectItem>
+                    </SelectContent>
+                  </Select>
+
+                  {/* Sort */}
+                  <Select
+                    value={sort}
+                    onValueChange={(v) => {
+                      setSort(v as any);
+                      setPage(1);
+                      setUnitSummary({});
+                    }}
+                  >
+                    <SelectTrigger className="w-full md:w-[200px]">
+                      <SelectValue placeholder="Sort" />
+                    </SelectTrigger>
+                    <SelectContent className="bg-background">
+                      <SelectItem value="UPDATED_DESC">Updated (newest)</SelectItem>
+                      <SelectItem value="NAME_ASC">Name (A→Z)</SelectItem>
+                    </SelectContent>
+                  </Select>
+
+                  {/* Clear */}
+                  <Button variant="outline" onClick={clearFilters} className="whitespace-nowrap">
+                    <X className="h-4 w-4 mr-2" />
+                    Clear
+                  </Button>
+                </div>
+              </div>
+
+              {/* Secondary row: pagination info */}
+              <div className="flex flex-col md:flex-row md:items-center gap-3 justify-between">
+                <div className="text-sm text-muted-foreground">
+                  Results: <b>{totalCount}</b> • Page <b>{page}</b> / <b>{totalPages}</b> • Expiry window:{" "}
+                  <b>{alertDays}</b> days
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <div className="text-sm text-muted-foreground">Page size</div>
+                  <Select
+                    value={String(pageSize)}
+                    onValueChange={(v) => {
+                      setPageSize(Number(v));
+                      setPage(1);
+                      setUnitSummary({});
+                    }}
+                  >
+                    <SelectTrigger className="w-[120px]">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent className="bg-background">
+                      <SelectItem value="10">10</SelectItem>
+                      <SelectItem value="20">20</SelectItem>
+                      <SelectItem value="50">50</SelectItem>
+                      <SelectItem value="100">100</SelectItem>
+                    </SelectContent>
+                  </Select>
+
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={page <= 1 || loading}
+                    onClick={() => setPage((p) => Math.max(1, p - 1))}
+                  >
+                    Prev
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={page >= totalPages || loading}
+                    onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                  >
+                    Next
+                  </Button>
                 </div>
               </div>
             </div>
@@ -444,12 +609,7 @@ export default function VendorProductsPage() {
                     <TableHead className="min-w-[320px]">Product</TableHead>
                     <TableHead>Brand</TableHead>
                     <TableHead>MRP</TableHead>
-
-                    {/* ✅ Units-based stock/expiry summary */}
-                    <TableHead className="min-w-[300px]">
-                      Units Summary
-                    </TableHead>
-
+                    <TableHead className="min-w-[340px]">Units Summary</TableHead>
                     <TableHead className="min-w-[180px]">Published</TableHead>
                     <TableHead>Updated</TableHead>
                     <TableHead className="text-right">Actions</TableHead>
@@ -457,17 +617,14 @@ export default function VendorProductsPage() {
                 </TableHeader>
 
                 <TableBody>
-                  {filtered.length === 0 ? (
+                  {rows.length === 0 ? (
                     <TableRow>
-                      <TableCell
-                        colSpan={7}
-                        className="text-center text-muted-foreground py-10"
-                      >
+                      <TableCell colSpan={7} className="text-center text-muted-foreground py-10">
                         {loading ? "Loading…" : "No products found"}
                       </TableCell>
                     </TableRow>
                   ) : (
-                    filtered.map((p) => {
+                    rows.map((p) => {
                       const s = unitSummary[p.id];
                       const total = s?.total ?? 0;
                       const inStock = s?.byStatus?.IN_STOCK ?? 0;
@@ -479,23 +636,18 @@ export default function VendorProductsPage() {
                       const expired = s?.expiredCount ?? 0;
                       const expSoon = s?.expiringSoonCount ?? 0;
 
-                      const lowStock =
-                        inStock > 0 && inStock <= lowStockThreshold;
+                      const lowStock = inStock > 0 && inStock <= lowStockThreshold;
 
                       return (
                         <TableRow key={p.id}>
                           <TableCell className="font-medium">
                             <div className="line-clamp-2">{p.name}</div>
-                            <div className="text-xs text-muted-foreground">
-                              {p.slug}
-                            </div>
+                            <div className="text-xs text-muted-foreground">{p.slug}</div>
                           </TableCell>
 
                           <TableCell>{p.brands?.name ?? "—"}</TableCell>
 
-                          <TableCell>
-                            {formatINR(p.price, p.currency)}
-                          </TableCell>
+                          <TableCell>{formatINR(p.sale_price, p.currency)}</TableCell>
 
                           <TableCell>
                             <div className="flex flex-wrap gap-2 items-center">
@@ -503,11 +655,7 @@ export default function VendorProductsPage() {
                                 Total: <b className="ml-1">{total}</b>
                               </Badge>
 
-                              <Badge
-                                className={
-                                  lowStock ? "bg-orange-500 text-white" : ""
-                                }
-                              >
+                              <Badge className={lowStock ? "bg-orange-500 text-white" : ""}>
                                 In stock: <b className="ml-1">{inStock}</b>
                               </Badge>
 
@@ -535,10 +683,7 @@ export default function VendorProductsPage() {
 
                               {expSoon > 0 ? (
                                 <span
-                                  className={`text-xs px-2 py-1 rounded ${expiryPillClass(
-                                    1,
-                                    alertDays
-                                  )}`}
+                                  className="text-xs px-2 py-1 rounded bg-yellow-400 text-black"
                                   title={`Expiring within ${alertDays} days`}
                                 >
                                   {expSoon} expiring soon
@@ -559,7 +704,6 @@ export default function VendorProductsPage() {
                             ) : null}
                           </TableCell>
 
-                          {/* Published */}
                           <TableCell className="whitespace-nowrap">
                             <div className="flex items-center gap-2">
                               <Switch
@@ -567,25 +711,18 @@ export default function VendorProductsPage() {
                                 onCheckedChange={(v) => togglePublish(p.id, v)}
                                 aria-label="Publish / hide"
                               />
-                              <Badge
-                                variant={
-                                  p.is_published ? "default" : "secondary"
-                                }
-                              >
+                              <Badge variant={p.is_published ? "default" : "secondary"}>
                                 {p.is_published ? "Published" : "Hidden"}
                               </Badge>
                             </div>
                           </TableCell>
 
                           <TableCell className="whitespace-nowrap text-sm">
-                            {new Date(p.updated_at).toLocaleDateString(
-                              "en-IN",
-                              {
-                                year: "numeric",
-                                month: "short",
-                                day: "numeric",
-                              }
-                            )}
+                            {new Date(p.updated_at).toLocaleDateString("en-IN", {
+                              year: "numeric",
+                              month: "short",
+                              day: "numeric",
+                            })}
                           </TableCell>
 
                           <TableCell className="text-right">
@@ -593,9 +730,7 @@ export default function VendorProductsPage() {
                               <Button
                                 variant="ghost"
                                 size="sm"
-                                onClick={() =>
-                                  router.push(`/vendor/products/${p.id}/units`)
-                                }
+                                onClick={() => router.push(`/vendor/products/${p.id}/units`)}
                                 title="Manage Units"
                               >
                                 <QrCode className="h-4 w-4" />
@@ -604,9 +739,7 @@ export default function VendorProductsPage() {
                               <Button
                                 variant="ghost"
                                 size="sm"
-                                onClick={() =>
-                                  router.push(`/vendor/products/${p.id}`)
-                                }
+                                onClick={() => router.push(`/vendor/products/${p.id}`)}
                                 title="Edit"
                               >
                                 <Edit className="h-4 w-4" />
@@ -630,16 +763,30 @@ export default function VendorProductsPage() {
               </Table>
             </div>
 
-            <div className="mt-4 flex justify-center">
-              {paging.more && (
+            {/* Bottom pagination */}
+            <div className="mt-4 flex flex-col md:flex-row items-center justify-between gap-3">
+              <div className="text-sm text-muted-foreground">
+                Showing page <b>{page}</b> of <b>{totalPages}</b> • Total <b>{totalCount}</b>
+              </div>
+
+              <div className="flex items-center gap-2">
                 <Button
                   variant="outline"
-                  onClick={() => loadPage(false)}
-                  disabled={loading}
+                  size="sm"
+                  disabled={page <= 1 || loading}
+                  onClick={() => setPage((p) => Math.max(1, p - 1))}
                 >
-                  {loading ? "Loading…" : "Load More"}
+                  Prev
                 </Button>
-              )}
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={page >= totalPages || loading}
+                  onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                >
+                  Next
+                </Button>
+              </div>
             </div>
           </CardContent>
         </Card>
