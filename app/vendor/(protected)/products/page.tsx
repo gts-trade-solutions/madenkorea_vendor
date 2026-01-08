@@ -608,7 +608,7 @@ export default function VendorProductsPage() {
                   <TableRow>
                     <TableHead className="min-w-[320px]">Product</TableHead>
                     <TableHead>Brand</TableHead>
-                    <TableHead>MRP</TableHead>
+                    {/* <TableHead>MRP</TableHead> */}
                     <TableHead className="min-w-[340px]">Units Summary</TableHead>
                     <TableHead className="min-w-[180px]">Published</TableHead>
                     <TableHead>Updated</TableHead>
@@ -647,7 +647,7 @@ export default function VendorProductsPage() {
 
                           <TableCell>{p.brands?.name ?? "—"}</TableCell>
 
-                          <TableCell>{formatINR(p.sale_price, p.currency)}</TableCell>
+                          {/* <TableCell>{formatINR(p.sale_price, p.currency)}</TableCell> */}
 
                           <TableCell>
                             <div className="flex flex-wrap gap-2 items-center">

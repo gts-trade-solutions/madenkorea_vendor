@@ -138,10 +138,10 @@ export function UnitUpsertDialog({
         setExpiryDate(toYmd(addYears(today, 2)));
         setUnitsCount(1);
 
-        // product: MUST prefer sale_price
+        // product: MUST prefer price
         const { data: p, error: pErr } = await supabase
           .from("products")
-          .select("id,name,product_code,price,sale_price,brand_id")
+          .select("id,name,product_code,price,price,brand_id")
           .eq("id", productId)
           .single();
 
@@ -155,12 +155,12 @@ export function UnitUpsertDialog({
           `${first2Letters(pName)}${rand4()}`;
         setProductCode(pCode);
 
-        const sp = (p as any)?.sale_price;
+        const sp = (p as any)?.price;
         const pr = (p as any)?.price;
 
-        // Use sale_price (as requested). If missing, fallback to price but warn.
+        // Use price (as requested). If missing, fallback to price but warn.
         if (sp == null) {
-          toast.warning("sale_price is null for this product. Using price as fallback.");
+          toast.warning("price is null for this product. Using price as fallback.");
         }
         const final = sp != null ? Number(sp) : Number(pr ?? 0);
         setSalePrice(Number.isFinite(final) ? final : 0);
@@ -229,7 +229,7 @@ export function UnitUpsertDialog({
         unit_code: `${batchBaseCode}-${pad3(i + 1)}`,
         manufacture_date: manufactureDate,
         expiry_date: expiryDate,
-        // keep price stored but NOT editable; set from sale_price
+        // keep price stored but NOT editable; set from price
         price: salePrice,
         status: "IN_STOCK" as InventoryStatus,
       }));
@@ -407,7 +407,7 @@ export function UnitUpsertDialog({
               <div className="text-sm font-medium mb-1">Sale price (auto)</div>
               <Input value={Number.isFinite(salePrice) ? String(salePrice) : "0"} readOnly />
               <div className="text-xs text-muted-foreground mt-1">
-                Fetched from products.sale_price (fallback to price if missing).
+                Fetched from products.price (fallback to price if missing).
               </div>
             </div>
 
@@ -427,7 +427,7 @@ export function UnitUpsertDialog({
                 <div className="text-sm font-medium mb-1">Batch Base Code (auto)</div>
                 <Input value={batchBaseCode} readOnly placeholder="Auto-generated" />
                 <div className="text-xs text-muted-foreground mt-1">
-                  product_code + brand_code + mfg + exp + sale_price
+                  product_code + brand_code + mfg + exp + price
                 </div>
               </div>
             </div>

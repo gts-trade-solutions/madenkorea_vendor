@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { createClient } from "@supabase/supabase-js";
 import { toast } from "sonner";
@@ -70,6 +70,7 @@ type UnitRow = {
   expiry_date: string | null;
   status: InventoryStatus;
   created_at: string;
+  price?: number | null; // ✅ unit price
   sold_customer_name?: string | null;
   sold_customer_phone?: string | null;
 };
@@ -133,7 +134,7 @@ export default function ProductUnitsPage({
 
   // pagination
   const [page, setPage] = useState(1);
-  const pageSize = 25;
+  const [pageSize, setPageSize] = useState<20 | 50 | 100>(20);
   const [totalCount, setTotalCount] = useState(0);
 
   // dialogs
@@ -146,8 +147,12 @@ export default function ProductUnitsPage({
 
   // export
   const [exporting, setExporting] = useState(false);
+  const [exportOpen, setExportOpen] = useState(false);
 
-  // applied-filters version (dates don’t auto-trigger fetch until Apply)
+  // filters modal
+  const [filtersOpen, setFiltersOpen] = useState(false);
+
+  // applied-filters version (fetch only when apply)
   const [filtersVersion, setFiltersVersion] = useState(0);
 
   const todayYmd = useMemo(() => toYmd(new Date()), []);
@@ -183,7 +188,11 @@ export default function ProductUnitsPage({
   const [bulkDeleteConfirm, setBulkDeleteConfirm] = useState("");
   const [bulkDeleting, setBulkDeleting] = useState(false);
 
-  // ---------------- SOLD customer dialog (kept minimal) ----------------
+  // ---------------- Bulk edit dialog ----------------
+
+  const [bulkNewPrice, setBulkNewPrice] = useState<string>(""); // empty = no change
+
+  // ---------------- SOLD customer dialog ----------------
   const [soldDialogOpen, setSoldDialogOpen] = useState(false);
   const [soldTargetUnit, setSoldTargetUnit] = useState<UnitRow | null>(null);
 
@@ -198,6 +207,37 @@ export default function ProductUnitsPage({
   const [custPhone, setCustPhone] = useState("");
   const [custEmail, setCustEmail] = useState("");
   const [custAddress, setCustAddress] = useState("");
+
+  const [bulkEditOpen, setBulkEditOpen] = useState(false);
+  const [bulkEditScope, setBulkEditScope] = useState<"SELECTED" | "FILTERED">(
+    "SELECTED"
+  );
+  const [bulkEditing, setBulkEditing] = useState(false);
+
+  const [bulkNewStatus, setBulkNewStatus] = useState<
+    InventoryStatus | "NO_CHANGE"
+  >("NO_CHANGE");
+
+  // ✅ NEW: dates (empty = no change)
+  const [bulkNewMfgDate, setBulkNewMfgDate] = useState<string>("");
+  const [bulkNewExpDate, setBulkNewExpDate] = useState<string>(""); // allow empty string = "no change"
+
+  // sort
+  const [sortBy, setSortBy] = useState<
+    | "created_desc"
+    | "created_asc"
+    | "exp_asc"
+    | "exp_desc"
+    | "mfg_desc"
+    | "mfg_asc"
+    | "code_asc"
+    | "code_desc"
+  >("created_desc");
+
+  // expired quick filter
+  const [expiredFilter, setExpiredFilter] = useState<
+    "ALL" | "EXPIRED" | "NOT_EXPIRED"
+  >("ALL");
 
   const resetSoldForm = () => {
     setCustQuery("");
@@ -217,6 +257,134 @@ export default function ProductUnitsPage({
     if (u.sold_customer_phone) setCustPhone(u.sold_customer_phone ?? "");
 
     setSoldDialogOpen(true);
+  };
+
+  // ---------------- Scan modal (NEW) ----------------
+  const [scanOpen, setScanOpen] = useState(false);
+  const [scanValue, setScanValue] = useState("");
+  const [scanLoading, setScanLoading] = useState(false);
+  const [scannedUnit, setScannedUnit] = useState<UnitRow | null>(null);
+  const scanInputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    if (!scanOpen) return;
+    const t = setTimeout(() => {
+      scanInputRef.current?.focus();
+      scanInputRef.current?.select();
+    }, 80);
+    return () => clearTimeout(t);
+  }, [scanOpen]);
+
+  const resetScan = () => {
+    setScanValue("");
+    setScannedUnit(null);
+    setTimeout(() => {
+      scanInputRef.current?.focus();
+      scanInputRef.current?.select();
+    }, 50);
+  };
+
+  // Print invoice (single scanned unit) — self-contained, no route dependency
+  const printSingleUnitInvoice = (u: UnitRow) => {
+    if (!product || !vendor) {
+      toast.error("Product/Vendor not ready");
+      return;
+    }
+
+    const now = new Date();
+    const html = `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>Invoice - ${u.unit_code}</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: Arial, Helvetica, sans-serif; margin: 24px; color: #111; }
+  .row { display:flex; justify-content:space-between; gap: 16px; }
+  .card { border: 1px solid #e5e7eb; border-radius: 10px; padding: 14px; }
+  .title { font-size: 18px; font-weight: 700; margin: 0 0 6px; }
+  .muted { color: #6b7280; font-size: 12px; }
+  table { width:100%; border-collapse: collapse; margin-top: 10px; }
+  th, td { border: 1px solid #e5e7eb; padding: 10px; text-align:left; }
+  th { background:#f9fafb; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+  .right { text-align:right; }
+  .big { font-size: 16px; font-weight: 700; }
+  .footer { margin-top: 16px; font-size: 12px; color:#6b7280; }
+  @media print { .no-print { display:none; } body { margin: 10mm; } }
+</style>
+</head>
+<body>
+  <div class="row">
+    <div>
+      <div class="title">Invoice</div>
+      <div class="muted">Generated: ${now.toLocaleString()}</div>
+    </div>
+    <div class="card" style="min-width: 280px;">
+      <div class="muted">Seller</div>
+      <div class="big">${vendor.display_name ?? "Vendor"}</div>
+      <div class="muted">Product: ${product.name}</div>
+      <div class="muted">Unit Code: ${u.unit_code}</div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top: 14px;">
+    <div class="muted">Customer (if SOLD)</div>
+    <div style="margin-top:6px;">
+      <b>${u.sold_customer_name ?? "-"}</b> ${
+      u.sold_customer_phone ? `(${u.sold_customer_phone})` : ""
+    }
+    </div>
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Item</th>
+        <th>Manufacture</th>
+        <th>Expiry</th>
+        <th>Status</th>
+        <th class="right">Price</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>
+          <div><b>${product.name}</b></div>
+          <div class="muted">Unit: ${u.unit_code}</div>
+        </td>
+        <td>${u.manufacture_date ?? "-"}</td>
+        <td>${u.expiry_date ?? "-"}</td>
+        <td>${u.status}</td>
+        <td class="right">${u.price ?? ""}</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="footer">
+    This invoice is generated from the Units screen (scan flow).
+  </div>
+
+  <div class="no-print" style="margin-top:14px;">
+    <button onclick="window.print()">Print</button>
+    <button onclick="window.close()">Close</button>
+  </div>
+</body>
+</html>`;
+
+    const w = window.open(
+      "",
+      "_blank",
+      "noopener,noreferrer,width=900,height=700"
+    );
+    if (!w) {
+      toast.error("Popup blocked. Please allow popups to print.");
+      return;
+    }
+    w.document.open();
+    w.document.write(html);
+    w.document.close();
+    w.focus();
+    // user can print from the opened window
   };
 
   // ---------------- Auth + vendor ----------------
@@ -317,6 +485,20 @@ export default function ProductUnitsPage({
     const s = search.trim();
     if (s) q = q.ilike("unit_code", `%${s}%`);
 
+    if (expiredFilter === "EXPIRED") {
+      q = q.not("expiry_date", "is", null).lt("expiry_date", todayYmd);
+    }
+    if (expiredFilter === "NOT_EXPIRED") {
+      // includeNoExpiry affects what "not expired" means:
+      // - if includeNoExpiry=true => not expired = (expiry_date is null OR expiry_date >= today)
+      // - if includeNoExpiry=false => not expired = (expiry_date >= today)
+      if (includeNoExpiry) {
+        q = q.or(`expiry_date.is.null,expiry_date.gte.${todayYmd}`);
+      } else {
+        q = q.gte("expiry_date", todayYmd);
+      }
+    }
+
     if (mfgFrom) q = q.gte("manufacture_date", mfgFrom);
     if (mfgTo) q = q.lte("manufacture_date", mfgTo);
 
@@ -361,14 +543,29 @@ export default function ProductUnitsPage({
       const to = from + pageSize - 1;
 
       let q = baseUnitsQuery(
-        "id,unit_code,manufacture_date,expiry_date,status,created_at,sold_customer_name,sold_customer_phone",
+        "id,unit_code,manufacture_date,expiry_date,status,created_at,price,sold_customer_name,sold_customer_phone",
         true
       );
       if (!q) return;
 
-      const { data, error, count } = await q
-        .order("created_at", { ascending: false })
-        .range(from, to);
+      if (sortBy === "created_desc")
+        q = q.order("created_at", { ascending: false });
+      else if (sortBy === "created_asc")
+        q = q.order("created_at", { ascending: true });
+      else if (sortBy === "exp_asc")
+        q = q.order("expiry_date", { ascending: true, nullsFirst: false });
+      else if (sortBy === "exp_desc")
+        q = q.order("expiry_date", { ascending: false, nullsFirst: false });
+      else if (sortBy === "mfg_desc")
+        q = q.order("manufacture_date", { ascending: false });
+      else if (sortBy === "mfg_asc")
+        q = q.order("manufacture_date", { ascending: true });
+      else if (sortBy === "code_asc")
+        q = q.order("unit_code", { ascending: true });
+      else if (sortBy === "code_desc")
+        q = q.order("unit_code", { ascending: false });
+
+      const { data, error, count } = await q.range(from, to);
 
       if (error) {
         toast.error(error.message || "Failed to load units");
@@ -387,18 +584,16 @@ export default function ProductUnitsPage({
     if (!ready || !vendor?.id) return;
     fetchUnits();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ready, vendor?.id, productId, page, statusFilter, filtersVersion]);
-
-  // debounced search
-  useEffect(() => {
-    if (!ready || !vendor?.id) return;
-    const t = setTimeout(() => {
-      setPage(1);
-      fetchUnits();
-    }, 350);
-    return () => clearTimeout(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [search]);
+  }, [
+    ready,
+    vendor?.id,
+    productId,
+    page,
+    statusFilter,
+    filtersVersion,
+    sortBy,
+    expiredFilter,
+  ]);
 
   const totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
 
@@ -466,7 +661,7 @@ export default function ProductUnitsPage({
     fetchUnits();
   };
 
-  // ---------------- Status updates (single) ----------------
+  // ---------------- Status updates (single row list) ----------------
   const updateStatusDirect = async (u: UnitRow, next: InventoryStatus) => {
     if (!vendor?.id) return;
     if (u.status === next) return;
@@ -478,7 +673,7 @@ export default function ProductUnitsPage({
 
     setUpdatingId(u.id);
 
-    // optimistic
+    // optimistic (list)
     setUnits((prev) =>
       prev.map((x) => (x.id === u.id ? { ...x, status: next } : x))
     );
@@ -501,6 +696,82 @@ export default function ProductUnitsPage({
     toast.success(`Status updated to ${next}`);
     await fetchUnits();
     setUpdatingId(null);
+  };
+
+  // ---------------- Status updates (scanned unit) ----------------
+  const updateScannedStatus = async (next: InventoryStatus) => {
+    if (!vendor?.id || !scannedUnit) return;
+    if (scannedUnit.status === next) return;
+
+    if (next === "SOLD") {
+      // use existing SOLD flow (customer dialog) without breaking features
+      openSoldDialogSingle(scannedUnit);
+      return;
+    }
+
+    setScanLoading(true);
+    const prev = scannedUnit.status;
+    setScannedUnit({ ...scannedUnit, status: next });
+
+    const { error } = await supabase
+      .from("inventory_units")
+      .update({ status: next })
+      .eq("id", scannedUnit.id)
+      .eq("vendor_id", vendor.id)
+      .eq("product_id", productId);
+
+    if (error) {
+      setScannedUnit({ ...scannedUnit, status: prev });
+      setScanLoading(false);
+      toast.error(error.message || "Failed to update status");
+      return;
+    }
+
+    toast.success(`Updated status to ${next}`);
+    setScanLoading(false);
+    // keep list in sync
+    await fetchUnits();
+  };
+
+  // ---------------- Scan: lookup unit by code ----------------
+  const lookupScannedUnit = async (raw?: string) => {
+    if (!vendor?.id) return;
+
+    const code = (raw ?? scanValue).trim();
+    if (!code) return;
+
+    setScanLoading(true);
+    try {
+      const { data, error } = await supabase
+        .from("inventory_units")
+        .select(
+          "id,unit_code,manufacture_date,expiry_date,status,created_at,price,sold_customer_name,sold_customer_phone"
+        )
+        .eq("vendor_id", vendor.id)
+        .eq("product_id", productId)
+        .eq("unit_code", code)
+        .maybeSingle();
+
+      if (error) throw error;
+
+      if (!data) {
+        setScannedUnit(null);
+        toast.error("Unit not found for this product");
+        return;
+      }
+
+      setScannedUnit(data as any);
+    } catch (e: any) {
+      console.error(e);
+      toast.error(e?.message || "Scan lookup failed");
+    } finally {
+      setScanLoading(false);
+      setTimeout(() => {
+        // keep cursor ready for next scan
+        scanInputRef.current?.focus();
+        scanInputRef.current?.select();
+      }, 60);
+    }
   };
 
   // ---------------- Customer suggestions ----------------
@@ -641,6 +912,21 @@ export default function ProductUnitsPage({
       }
 
       toast.success("Marked SOLD with customer details");
+
+      // keep scan panel in sync too
+      if (scannedUnit?.id === soldTargetUnit.id) {
+        setScannedUnit((prev) =>
+          prev
+            ? {
+                ...prev,
+                status: "SOLD",
+                sold_customer_name: name,
+                sold_customer_phone: phone || null,
+              }
+            : prev
+        );
+      }
+
       setSoldDialogOpen(false);
       setSoldTargetUnit(null);
       resetSoldForm();
@@ -656,7 +942,7 @@ export default function ProductUnitsPage({
 
     const header = [
       "product_name",
-      "mrp_price",
+      "unit_price",
       "unit_code",
       "status",
       "manufacture_date",
@@ -666,13 +952,11 @@ export default function ProductUnitsPage({
     ];
     const lines = [header.join(",")];
 
-    const mrp = product.sale_price ?? "";
-
     for (const u of rows) {
       lines.push(
         [
           csvEscape(product.name),
-          csvEscape(mrp),
+          csvEscape(u.price ?? ""),
           csvEscape(u.unit_code),
           csvEscape(u.status),
           csvEscape(u.manufacture_date ?? ""),
@@ -718,7 +1002,7 @@ export default function ProductUnitsPage({
         const to = from + chunk - 1;
 
         let q = baseUnitsQuery(
-          "id,unit_code,manufacture_date,expiry_date,status,created_at,sold_customer_name,sold_customer_phone",
+          "id,unit_code,manufacture_date,expiry_date,status,created_at,price,sold_customer_name,sold_customer_phone",
           false
         );
         if (!q) return;
@@ -748,10 +1032,8 @@ export default function ProductUnitsPage({
     }
   };
 
-  // ✅ NEW: Export Selected (all pages)
   const fetchSelectedUnits = async (): Promise<UnitRow[]> => {
     if (!vendor?.id) return [];
-
     const ids = Array.from(selectedIds);
     if (ids.length === 0) return [];
 
@@ -762,7 +1044,7 @@ export default function ProductUnitsPage({
       const { data, error } = await supabase
         .from("inventory_units")
         .select(
-          "id,unit_code,manufacture_date,expiry_date,status,created_at,sold_customer_name,sold_customer_phone"
+          "id,unit_code,manufacture_date,expiry_date,status,created_at,price,sold_customer_name,sold_customer_phone"
         )
         .eq("vendor_id", vendor.id)
         .eq("product_id", productId)
@@ -834,7 +1116,6 @@ export default function ProductUnitsPage({
         toast.success(`Deleted ${ids.length} selected units`);
         setSelectedIds(new Set());
       } else {
-        // FILTERED
         let q = supabase
           .from("inventory_units")
           .delete()
@@ -862,73 +1143,234 @@ export default function ProductUnitsPage({
     }
   };
 
+  // ---------------- Bulk edit handler (status + price) ----------------
+  const runBulkEdit = async () => {
+    if (!vendor?.id) return;
+
+    const patch: Record<string, any> = {};
+
+    if (bulkNewStatus !== "NO_CHANGE") {
+      if (bulkNewStatus === "SOLD") {
+        toast.error(
+          'Bulk set to "SOLD" is not allowed (needs customer details).'
+        );
+        return;
+      }
+      patch.status = bulkNewStatus;
+    }
+
+    // Manufacture date
+    if (bulkNewMfgDate.trim() !== "") {
+      patch.manufacture_date = bulkNewMfgDate;
+    }
+
+    // Expiry date
+    // - empty => no change (because user didn’t set it)
+    // - if you want to allow "set expiry to NULL", you can add a checkbox later.
+    if (bulkNewExpDate.trim() !== "") {
+      patch.expiry_date = bulkNewExpDate;
+    }
+
+    if (Object.keys(patch).length === 0) {
+      toast.error("Nothing to update");
+      return;
+    }
+
+    setBulkEditing(true);
+    try {
+      if (bulkEditScope === "SELECTED") {
+        const ids = Array.from(selectedIds);
+        if (ids.length === 0) {
+          toast.error("No units selected");
+          return;
+        }
+
+        for (let i = 0; i < ids.length; i += 500) {
+          const slice = ids.slice(i, i + 500);
+          const { error } = await supabase
+            .from("inventory_units")
+            .update(patch)
+            .eq("vendor_id", vendor.id)
+            .eq("product_id", productId)
+            .in("id", slice);
+
+          if (error) {
+            toast.error(error.message || "Bulk edit failed");
+            return;
+          }
+        }
+
+        toast.success(`Updated ${ids.length} selected units`);
+      } else {
+        let q = supabase
+          .from("inventory_units")
+          .update(patch)
+          .eq("vendor_id", vendor.id)
+          .eq("product_id", productId);
+
+        q = applyUnitFilters(q);
+
+        const { error } = await q;
+        if (error) {
+          toast.error(error.message || "Bulk edit failed");
+          return;
+        }
+
+        toast.success("Updated filtered units");
+      }
+
+      setBulkEditOpen(false);
+      setBulkNewStatus("NO_CHANGE");
+      setBulkNewMfgDate("");
+      setBulkNewExpDate("");
+      await fetchUnits();
+    } finally {
+      setBulkEditing(false);
+    }
+  };
+
+  // ---------------- Filter modal apply/clear ----------------
+  const applyFilters = () => {
+    setPage(1);
+    setFiltersVersion((x) => x + 1);
+    setFiltersOpen(false);
+  };
+
+  const clearAllFilters = () => {
+    setSearch("");
+    setStatusFilter("ALL");
+    setMfgFrom("");
+    setMfgTo("");
+    setExpFrom("");
+    setExpTo("");
+    setIncludeNoExpiry(true);
+    setSelectedIds(new Set());
+    setPage(1);
+    setFiltersVersion((x) => x + 1);
+    setFiltersOpen(false);
+  };
+
   if (!hydrated) return null;
 
   return (
     <div className="space-y-4">
       <Card>
-        <CardHeader className="flex flex-row items-center justify-between gap-3">
-          <CardTitle className="text-lg">
-            Units — {product?.name ?? "Product"}
-          </CardTitle>
+        <CardHeader className="flex flex-row items-start justify-between gap-3">
+          <div className="space-y-1">
+            <CardTitle className="text-lg">
+              Units — {product?.name ?? "Product"}
+            </CardTitle>
+
+            {activeFilterSummary.length > 0 ? (
+              <div className="text-xs text-muted-foreground">
+                Active filters: <b>{activeFilterSummary.join(" • ")}</b>
+              </div>
+            ) : (
+              <div className="text-xs text-muted-foreground">
+                No filters applied
+              </div>
+            )}
+          </div>
 
           <div className="flex flex-wrap gap-2 justify-end">
             <Button variant="outline" onClick={() => router.back()}>
               Back
             </Button>
-
             <Button
               variant="outline"
-              onClick={exportCurrentPage}
-              disabled={!product || loading}
+              onClick={() => {
+                // clear filters
+                setSearch("");
+                setStatusFilter("ALL");
+                setMfgFrom("");
+                setMfgTo("");
+                setExpFrom("");
+                setExpTo("");
+                setIncludeNoExpiry(true);
+
+                // clear selection + reset pagination
+                setSelectedIds(new Set());
+                setPage(1);
+
+                // force refetch (also ensures list matches cleared filters)
+                setFiltersVersion((x) => x + 1);
+
+                toast.success("Refreshed");
+              }}
+              disabled={!ready}
+              title="Clear filters and refresh"
             >
-              Export Page
+              Refresh
+            </Button>
+            {/* ✅ NEW: Scan Unit */}
+            <Button
+              variant="outline"
+              onClick={() => {
+                setScanOpen(true);
+                setScannedUnit(null);
+                // keep existing value so continuous scanning works
+                setTimeout(() => {
+                  scanInputRef.current?.focus();
+                  scanInputRef.current?.select();
+                }, 80);
+              }}
+              disabled={!ready || !vendor?.id}
+              title="Scan unit code to open the unit details"
+            >
+              Scan Unit
             </Button>
 
             <Button
               variant="outline"
-              onClick={exportFilteredAll}
-              disabled={exporting || !product}
+              onClick={() => setFiltersOpen(true)}
+              disabled={!ready}
+              title="Open filters"
             >
-              {exporting ? "Exporting…" : "Export Filtered"}
+              Filters
             </Button>
 
-            {/* ✅ NEW */}
             <Button
               variant="outline"
-              onClick={exportSelected}
-              disabled={exporting || selectedIds.size === 0 || !product}
-              title="Export selected units"
+              onClick={() => setExportOpen(true)}
+              disabled={!product}
+              title="Export options"
             >
-              Export Selected ({selectedIds.size})
+              Export
             </Button>
 
             <Button onClick={() => setCreateOpen(true)}>Add units</Button>
 
-            {/* ✅ Bulk Delete */}
             <Button
-              variant="destructive"
-              disabled={selectedIds.size === 0}
+              variant="outline"
               onClick={() => {
-                setBulkDeleteScope("SELECTED");
-                setBulkDeleteConfirm("");
-                setBulkDeleteOpen(true);
+                setBulkEditScope(
+                  selectedIds.size > 0 ? "SELECTED" : "FILTERED"
+                );
+                setBulkNewStatus("NO_CHANGE");
+                setBulkNewPrice("");
+                setBulkEditOpen(true);
               }}
-              title="Delete selected units"
+              disabled={totalCount === 0}
+              title="Bulk edit status/price"
             >
-              Delete Selected ({selectedIds.size})
+              Bulk Edit
+              {selectedIds.size > 0 ? ` (${selectedIds.size})` : ""}
             </Button>
 
             <Button
               variant="destructive"
               onClick={() => {
-                setBulkDeleteScope("FILTERED");
+                setBulkDeleteScope(
+                  selectedIds.size > 0 ? "SELECTED" : "FILTERED"
+                );
                 setBulkDeleteConfirm("");
                 setBulkDeleteOpen(true);
               }}
-              title="Delete filtered units"
+              disabled={totalCount === 0}
+              title="Bulk delete"
             >
-              Delete Filtered ({totalCount})
+              Bulk Delete
+              {selectedIds.size > 0 ? ` (${selectedIds.size})` : ""}
             </Button>
           </div>
         </CardHeader>
@@ -942,8 +1384,13 @@ export default function ProductUnitsPage({
                 • Brand Code: <b>{brand.brand_code ?? "-"}</b>
               </>
             ) : null}{" "}
-            • MRP: <b>{product?.sale_price ?? "-"}</b> • Expired on this page:{" "}
-            <b>{expiredCountThisPage}</b>
+            • Expired on this page: <b>{expiredCountThisPage}</b>
+            {selectedIds.size > 0 ? (
+              <>
+                {" "}
+                • Selected: <b>{selectedIds.size}</b>
+              </>
+            ) : null}
           </div>
 
           <div className="grid grid-cols-2 md:grid-cols-6 gap-2 text-sm">
@@ -962,181 +1409,93 @@ export default function ProductUnitsPage({
             <div>
               Returned: <b>{countsThisPage.RETURNED}</b>
             </div>
-            <div>
+            {/* <div>
               Out: <b>{countsThisPage.OUT_OF_STOCK}</b>
-            </div>
+            </div> */}
           </div>
-
-          {/* Filters */}
-          <div className="rounded-md border p-3 space-y-3">
-            <div className="flex flex-col md:flex-row gap-2 md:items-center">
-              <Input
-                value={search}
-                onChange={(e) => setSearch(e.target.value)}
-                placeholder="Search unit code…"
-                className="max-w-sm"
-              />
-
-              <Select
-                value={statusFilter}
-                onValueChange={(v) => {
-                  setStatusFilter(v as any);
-                  setPage(1);
-                }}
-              >
-                <SelectTrigger className="w-[220px]">
-                  <SelectValue placeholder="Filter status" />
-                </SelectTrigger>
-                <SelectContent
-                  position="popper"
-                  side="bottom"
-                  align="start"
-                  sideOffset={6}
-                  className="z-[200] bg-background text-foreground border shadow-lg p-1"
-                >
-                  <SelectItem value="ALL">All</SelectItem>
-                  <SelectItem value="IN_STOCK">In stock</SelectItem>
-                  <SelectItem value="INVOICED">Invoiced</SelectItem>
-                  <SelectItem value="DEMO">Demo</SelectItem>
-                  <SelectItem value="SOLD">Sold</SelectItem>
-                  <SelectItem value="RETURNED">Returned</SelectItem>
-                  <SelectItem value="OUT_OF_STOCK">Out of stock</SelectItem>
-                </SelectContent>
-              </Select>
-
-              <div className="ml-auto text-sm text-muted-foreground">
-                Total: <b>{totalCount}</b> • Page <b>{page}</b> /{" "}
-                <b>{totalPages}</b>
-              </div>
-            </div>
-
-            <div className="flex flex-col md:flex-row gap-2 md:items-end">
-              <div className="flex gap-2 flex-wrap">
-                <div className="space-y-1">
-                  <div className="text-xs text-muted-foreground">MFG from</div>
-                  <Input
-                    type="date"
-                    value={mfgFrom}
-                    onChange={(e) => setMfgFrom(e.target.value)}
-                    className="w-[170px]"
-                  />
-                </div>
-                <div className="space-y-1">
-                  <div className="text-xs text-muted-foreground">MFG to</div>
-                  <Input
-                    type="date"
-                    value={mfgTo}
-                    onChange={(e) => setMfgTo(e.target.value)}
-                    className="w-[170px]"
-                  />
-                </div>
-                <div className="space-y-1">
-                  <div className="text-xs text-muted-foreground">EXP from</div>
-                  <Input
-                    type="date"
-                    value={expFrom}
-                    onChange={(e) => setExpFrom(e.target.value)}
-                    className="w-[170px]"
-                  />
-                </div>
-                <div className="space-y-1">
-                  <div className="text-xs text-muted-foreground">EXP to</div>
-                  <Input
-                    type="date"
-                    value={expTo}
-                    onChange={(e) => setExpTo(e.target.value)}
-                    className="w-[170px]"
-                  />
-                </div>
-
-                <label className="flex items-center gap-2 text-sm ml-2">
-                  <input
-                    type="checkbox"
-                    checked={includeNoExpiry}
-                    onChange={(e) => setIncludeNoExpiry(e.target.checked)}
-                  />
-                  Include no-expiry
-                </label>
-              </div>
-
-              <div className="flex gap-2 md:ml-auto">
-                <Button
-                  variant="outline"
-                  onClick={() => {
-                    setPage(1);
-                    setFiltersVersion((x) => x + 1);
-                  }}
-                >
-                  Apply
-                </Button>
-
-                <Button
-                  variant="outline"
-                  onClick={() => {
-                    setMfgFrom("");
-                    setMfgTo("");
-                    setExpFrom("");
-                    setExpTo("");
-                    setIncludeNoExpiry(true);
-                    setStatusFilter("ALL");
-                    setSearch("");
-                    setSelectedIds(new Set());
-                    setPage(1);
-                    setFiltersVersion((x) => x + 1);
-                  }}
-                >
-                  Clear all
-                </Button>
-              </div>
-            </div>
-
-            {activeFilterSummary.length > 0 ? (
-              <div className="text-xs text-muted-foreground">
-                Active filters: <b>{activeFilterSummary.join(" • ")}</b>
-              </div>
-            ) : null}
-          </div>
-
-          {selectedIds.size > 0 ? (
-            <div className="flex items-center justify-between text-sm">
-              <div>
-                Selected: <b>{selectedIds.size}</b>
-              </div>
-              <div className="flex gap-2">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={exportSelected}
-                  disabled={exporting || !product}
-                >
-                  Export Selected
-                </Button>
-                <Button
-                  variant="destructive"
-                  size="sm"
-                  onClick={() => {
-                    setBulkDeleteScope("SELECTED");
-                    setBulkDeleteConfirm("");
-                    setBulkDeleteOpen(true);
-                  }}
-                >
-                  Delete Selected
-                </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => setSelectedIds(new Set())}
-                >
-                  Clear selection
-                </Button>
-              </div>
-            </div>
-          ) : null}
         </CardContent>
       </Card>
 
       <Card>
         <CardContent className="pt-4">
+          <div className="flex flex-col md:flex-row md:items-center justify-between gap-2 pb-3">
+            <div className="text-sm text-muted-foreground">
+              Total: <b>{totalCount}</b> • Page <b>{page}</b> /{" "}
+              <b>{totalPages}</b>
+            </div>
+
+            <div className="flex items-center gap-2 justify-end">
+              <div className="text-sm text-muted-foreground">Rows</div>
+              <Select
+                value={String(pageSize)}
+                onValueChange={(v) => {
+                  const n = Number(v) as 20 | 50 | 100;
+                  setPageSize(n);
+                  setPage(1);
+                }}
+              >
+                <SelectTrigger className="w-[120px]">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent className="bg-background">
+                  <SelectItem value="20">20</SelectItem>
+                  <SelectItem value="50">50</SelectItem>
+                  <SelectItem value="100">100</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+          <div className="flex items-center gap-3 ml-auto">
+            {/* Expired filter */}
+            <Select
+              value={expiredFilter}
+              onValueChange={(v) => {
+                setExpiredFilter(v as any);
+                setPage(1);
+                setFiltersVersion((x) => x + 1);
+              }}
+            >
+              <SelectTrigger className="w-[160px]">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent className="bg-background">
+                <SelectItem value="ALL">All</SelectItem>
+                <SelectItem value="EXPIRED">Expired only</SelectItem>
+                <SelectItem value="NOT_EXPIRED">Not expired</SelectItem>
+              </SelectContent>
+            </Select>
+
+            {/* Sort */}
+            <Select
+              value={sortBy}
+              onValueChange={(v) => {
+                setSortBy(v as any);
+                setPage(1);
+              }}
+            >
+              <SelectTrigger className="w-[200px]">
+                <SelectValue placeholder="Sort" />
+              </SelectTrigger>
+              <SelectContent className="bg-background">
+                <SelectItem value="created_desc">Created: Newest</SelectItem>
+                <SelectItem value="created_asc">Created: Oldest</SelectItem>
+                <SelectItem value="exp_asc">Expiry: Earliest</SelectItem>
+                <SelectItem value="exp_desc">Expiry: Latest</SelectItem>
+                <SelectItem value="mfg_desc">MFG: Newest</SelectItem>
+                <SelectItem value="mfg_asc">MFG: Oldest</SelectItem>
+                <SelectItem value="code_asc">Unit code: A–Z</SelectItem>
+                <SelectItem value="code_desc">Unit code: Z–A</SelectItem>
+              </SelectContent>
+            </Select>
+
+            {/* Optional small badge */}
+            {expiredCountThisPage > 0 ? (
+              <span className="text-xs px-2 py-1 rounded-md border bg-muted">
+                Expired: <b>{expiredCountThisPage}</b>
+              </span>
+            ) : null}
+          </div>
+
           {loading ? (
             <div className="text-sm text-muted-foreground">Loading…</div>
           ) : (
@@ -1240,9 +1599,9 @@ export default function ProductUnitsPage({
                                 <SelectItem value="RETURNED">
                                   RETURNED
                                 </SelectItem>
-                                <SelectItem value="OUT_OF_STOCK">
+                                {/* <SelectItem value="OUT_OF_STOCK">
                                   OUT_OF_STOCK
-                                </SelectItem>
+                                </SelectItem> */}
                               </SelectContent>
                             </Select>
 
@@ -1353,9 +1712,493 @@ export default function ProductUnitsPage({
         />
       ) : null}
 
+      {/* ✅ Scan Modal */}
+      <Dialog
+        open={scanOpen}
+        onOpenChange={(v) => {
+          setScanOpen(v);
+          if (!v) {
+            // don’t wipe everything (so scanner flow is smooth), but clear scanned card
+            setScannedUnit(null);
+          }
+        }}
+      >
+        <DialogContent className="sm:max-w-[720px]">
+          <DialogHeader>
+            <DialogTitle>Scan unit</DialogTitle>
+            <DialogDescription>
+              Plug in your scanner, click inside the box, and scan. (Most
+              scanners type the code + press Enter automatically.)
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-3">
+            <div className="rounded-md border p-3">
+              <div className="text-xs text-muted-foreground mb-2">
+                Scan cursor area
+              </div>
+
+              <div className="flex gap-2">
+                <Input
+                  ref={scanInputRef}
+                  value={scanValue}
+                  onChange={(e) => setScanValue(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      lookupScannedUnit();
+                    }
+                  }}
+                  placeholder="Scan / type unit code and press Enter…"
+                  className="h-12 text-base font-mono"
+                />
+                <Button
+                  onClick={() => lookupScannedUnit()}
+                  disabled={!scanValue.trim() || scanLoading}
+                  className="h-12"
+                >
+                  {scanLoading ? "Checking…" : "Lookup"}
+                </Button>
+              </div>
+
+              <div className="flex flex-wrap gap-2 mt-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={resetScan}
+                  disabled={scanLoading}
+                >
+                  Clear
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    scanInputRef.current?.focus();
+                    scanInputRef.current?.select();
+                  }}
+                  disabled={scanLoading}
+                >
+                  Focus
+                </Button>
+              </div>
+            </div>
+
+            {/* Scanned unit details */}
+            {scannedUnit ? (
+              <div className="rounded-md border p-3 space-y-3">
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <div className="text-sm text-muted-foreground">Unit</div>
+                    <div className="text-lg font-mono font-semibold">
+                      {scannedUnit.unit_code}
+                    </div>
+                    <div className="text-xs text-muted-foreground mt-1">
+                      MFG: <b>{scannedUnit.manufacture_date ?? "-"}</b> • EXP:{" "}
+                      <b>{scannedUnit.expiry_date ?? "-"}</b> • Price:{" "}
+                      <b>{scannedUnit.price ?? "-"}</b>
+                    </div>
+                  </div>
+
+                  <div className="flex flex-wrap gap-2 justify-end">
+                    <Button
+                      variant="outline"
+                      onClick={() => {
+                        // open existing edit dialog, keep everything unchanged
+                        setEditUnit(scannedUnit);
+                        setEditOpen(true);
+                      }}
+                    >
+                      Edit Unit
+                    </Button>
+
+                    <Button
+                      variant="outline"
+                      onClick={() => printSingleUnitInvoice(scannedUnit)}
+                      disabled={!product || !vendor}
+                      title="Print invoice for this unit"
+                    >
+                      Print Invoice
+                    </Button>
+
+                    <Button
+                      variant="outline"
+                      onClick={() => {
+                        // optional: show it in list using existing filters
+                        setSearch(scannedUnit.unit_code);
+                        setPage(1);
+                        setFiltersVersion((x) => x + 1);
+                        toast.success("Applied scanned unit to list filter");
+                        setScanOpen(false);
+                      }}
+                      title="Filter list by this unit"
+                    >
+                      Show in List
+                    </Button>
+                  </div>
+                </div>
+
+                <div className="flex items-center flex-wrap gap-2">
+                  <UnitStatusBadge
+                    status={scannedUnit.status}
+                    expired={
+                      !!(
+                        scannedUnit.expiry_date &&
+                        String(scannedUnit.expiry_date).slice(0, 10) < todayYmd
+                      )
+                    }
+                  />
+
+                  <div className="w-[220px]">
+                    <Select
+                      value={scannedUnit.status}
+                      onValueChange={(v) =>
+                        updateScannedStatus(v as InventoryStatus)
+                      }
+                      disabled={scanLoading}
+                    >
+                      <SelectTrigger className="h-9 w-full">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent className="bg-background">
+                        <SelectItem value="IN_STOCK">IN_STOCK</SelectItem>
+                        <SelectItem value="INVOICED">INVOICED</SelectItem>
+                        <SelectItem value="DEMO">DEMO</SelectItem>
+                        <SelectItem value="SOLD">SOLD</SelectItem>
+                        <SelectItem value="RETURNED">RETURNED</SelectItem>
+                        {/* <SelectItem value="OUT_OF_STOCK">
+                          OUT_OF_STOCK
+                        </SelectItem> */}
+                      </SelectContent>
+                    </Select>
+                  </div>
+
+                  {scannedUnit.status !== "SOLD" ? (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-9"
+                      disabled={scanLoading}
+                      onClick={() => openSoldDialogSingle(scannedUnit)}
+                    >
+                      Mark Sold
+                    </Button>
+                  ) : (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-9"
+                      disabled={scanLoading}
+                      onClick={() => updateScannedStatus("RETURNED")}
+                    >
+                      Mark Returned
+                    </Button>
+                  )}
+
+                  {scannedUnit.status === "SOLD" &&
+                  (scannedUnit.sold_customer_name ||
+                    scannedUnit.sold_customer_phone) ? (
+                    <span className="text-xs text-muted-foreground">
+                      • {scannedUnit.sold_customer_name ?? "Customer"}{" "}
+                      {scannedUnit.sold_customer_phone
+                        ? `(${scannedUnit.sold_customer_phone})`
+                        : ""}
+                    </span>
+                  ) : null}
+                </div>
+
+                <div className="text-xs text-muted-foreground">
+                  Tip: After updating status, keep scanning the next unit —
+                  cursor stays in the scan box.
+                </div>
+              </div>
+            ) : null}
+          </div>
+
+          <DialogFooter className="gap-2">
+            <Button variant="outline" onClick={() => setScanOpen(false)}>
+              Close
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* ✅ Filters Modal */}
+      <Dialog open={filtersOpen} onOpenChange={setFiltersOpen}>
+        <DialogContent className="sm:max-w-[620px]">
+          <DialogHeader>
+            <DialogTitle>Filters</DialogTitle>
+            <DialogDescription>
+              Set filters and click Apply. (Dates are optional.)
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-4">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <div className="space-y-1">
+                <div className="text-xs text-muted-foreground">
+                  Search unit code
+                </div>
+                <Input
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                  placeholder="Eg: ABC-001"
+                />
+              </div>
+
+              <div className="space-y-1">
+                <div className="text-xs text-muted-foreground">Status</div>
+                <Select
+                  value={statusFilter}
+                  onValueChange={(v) => setStatusFilter(v as any)}
+                >
+                  <SelectTrigger className="w-full">
+                    <SelectValue placeholder="All" />
+                  </SelectTrigger>
+                  <SelectContent className="bg-background">
+                    <SelectItem value="ALL">All</SelectItem>
+                    <SelectItem value="IN_STOCK">IN_STOCK</SelectItem>
+                    <SelectItem value="INVOICED">INVOICED</SelectItem>
+                    <SelectItem value="DEMO">DEMO</SelectItem>
+                    <SelectItem value="SOLD">SOLD</SelectItem>
+                    <SelectItem value="RETURNED">RETURNED</SelectItem>
+                    {/* <SelectItem value="OUT_OF_STOCK">OUT_OF_STOCK</SelectItem> */}
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+
+            <div className="rounded-md border p-3 space-y-3">
+              <div className="text-sm font-medium">Manufacture Date Range</div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div className="space-y-1">
+                  <div className="text-xs text-muted-foreground">MFG From</div>
+                  <Input
+                    type="date"
+                    value={mfgFrom}
+                    onChange={(e) => setMfgFrom(e.target.value)}
+                  />
+                </div>
+                <div className="space-y-1">
+                  <div className="text-xs text-muted-foreground">MFG To</div>
+                  <Input
+                    type="date"
+                    value={mfgTo}
+                    onChange={(e) => setMfgTo(e.target.value)}
+                  />
+                </div>
+              </div>
+            </div>
+
+            <div className="rounded-md border p-3 space-y-3">
+              <div className="flex items-center justify-between gap-2">
+                <div className="text-sm font-medium">Expiry Date Range</div>
+                <label className="flex items-center gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={includeNoExpiry}
+                    onChange={(e) => setIncludeNoExpiry(e.target.checked)}
+                  />
+                  Include no-expiry
+                </label>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div className="space-y-1">
+                  <div className="text-xs text-muted-foreground">EXP From</div>
+                  <Input
+                    type="date"
+                    value={expFrom}
+                    onChange={(e) => setExpFrom(e.target.value)}
+                  />
+                </div>
+                <div className="space-y-1">
+                  <div className="text-xs text-muted-foreground">EXP To</div>
+                  <Input
+                    type="date"
+                    value={expTo}
+                    onChange={(e) => setExpTo(e.target.value)}
+                  />
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <DialogFooter className="gap-2">
+            <Button variant="outline" onClick={() => setFiltersOpen(false)}>
+              Cancel
+            </Button>
+            <Button variant="outline" onClick={clearAllFilters}>
+              Clear all
+            </Button>
+            <Button onClick={applyFilters}>Apply</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* ✅ Export Modal */}
+      <Dialog open={exportOpen} onOpenChange={setExportOpen}>
+        <DialogContent className="sm:max-w-[560px]">
+          <DialogHeader>
+            <DialogTitle>Export</DialogTitle>
+            <DialogDescription>
+              Choose what you want to export (CSV).
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-3">
+            <div className="rounded-md border p-3">
+              <div className="text-sm font-medium">Options</div>
+              <div className="text-xs text-muted-foreground mt-1">
+                Uses <b>inventory_units.price</b> as unit_price.
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+              <Button
+                variant="outline"
+                onClick={() => {
+                  setExportOpen(false);
+                  exportCurrentPage();
+                }}
+                disabled={!product || loading}
+              >
+                Export Page ({units.length})
+              </Button>
+
+              <Button
+                variant="outline"
+                onClick={() => {
+                  setExportOpen(false);
+                  exportFilteredAll();
+                }}
+                disabled={exporting || !product}
+              >
+                {exporting ? "Exporting…" : `Export Filtered (${totalCount})`}
+              </Button>
+
+              <Button
+                variant="outline"
+                onClick={() => {
+                  setExportOpen(false);
+                  exportSelected();
+                }}
+                disabled={exporting || selectedIds.size === 0 || !product}
+              >
+                Export Selected ({selectedIds.size})
+              </Button>
+            </div>
+          </div>
+
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setExportOpen(false)}>
+              Close
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* ✅ Bulk Edit Dialog */}
+      <Dialog open={bulkEditOpen} onOpenChange={setBulkEditOpen}>
+        <DialogContent className="sm:max-w-[620px]">
+          <DialogHeader>
+            <DialogTitle>Bulk edit units</DialogTitle>
+            <DialogDescription>
+              Update status and/or dates in one action. Bulk setting to{" "}
+              <b>SOLD</b> is disabled (needs customer details).
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-4">
+            <div className="space-y-2">
+              <div className="text-sm text-muted-foreground">Scope</div>
+              <Select
+                value={bulkEditScope}
+                onValueChange={(v) => setBulkEditScope(v as any)}
+              >
+                <SelectTrigger className="w-[260px]">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent className="bg-background">
+                  <SelectItem value="SELECTED">
+                    Selected ({selectedIds.size})
+                  </SelectItem>
+                  <SelectItem value="FILTERED">
+                    Filtered (current filters: {totalCount})
+                  </SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div className="space-y-1">
+                <div className="text-xs text-muted-foreground">New status</div>
+                <Select
+                  value={bulkNewStatus}
+                  onValueChange={(v) =>
+                    setBulkNewStatus(v as InventoryStatus | "NO_CHANGE")
+                  }
+                >
+                  <SelectTrigger className="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent className="bg-background">
+                    <SelectItem value="NO_CHANGE">No change</SelectItem>
+                    <SelectItem value="IN_STOCK">IN_STOCK</SelectItem>
+                    <SelectItem value="INVOICED">INVOICED</SelectItem>
+                    <SelectItem value="DEMO">DEMO</SelectItem>
+                    <SelectItem value="RETURNED">RETURNED</SelectItem>
+                    {/* <SelectItem value="OUT_OF_STOCK">OUT_OF_STOCK</SelectItem> */}
+                  </SelectContent>
+                </Select>
+              </div>
+
+              <div className="space-y-1">
+                <div className="text-xs text-muted-foreground">
+                  New manufacture date (leave empty = no change)
+                </div>
+                <Input
+                  type="date"
+                  value={bulkNewMfgDate}
+                  onChange={(e) => setBulkNewMfgDate(e.target.value)}
+                />
+              </div>
+
+              <div className="space-y-1 sm:col-span-2">
+                <div className="text-xs text-muted-foreground">
+                  New expiry date (leave empty = no change)
+                </div>
+                <Input
+                  type="date"
+                  value={bulkNewExpDate}
+                  onChange={(e) => setBulkNewExpDate(e.target.value)}
+                />
+                <div className="text-xs text-muted-foreground">
+                  Note: this updates expiry_date to the given date. (No option
+                  here to set expiry to null yet.)
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <DialogFooter className="gap-2">
+            <Button
+              variant="outline"
+              onClick={() => setBulkEditOpen(false)}
+              disabled={bulkEditing}
+            >
+              Cancel
+            </Button>
+            <Button onClick={runBulkEdit} disabled={bulkEditing}>
+              {bulkEditing ? "Updating…" : "Apply changes"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       {/* Bulk Delete Dialog */}
       <Dialog open={bulkDeleteOpen} onOpenChange={setBulkDeleteOpen}>
-        <DialogContent className="sm:max-w-[520px]">
+        <DialogContent className="sm:max-w-[560px]">
           <DialogHeader>
             <DialogTitle className="text-destructive">
               Bulk delete units
@@ -1377,7 +2220,7 @@ export default function ProductUnitsPage({
               value={bulkDeleteScope}
               onValueChange={(v) => setBulkDeleteScope(v as any)}
             >
-              <SelectTrigger className="w-[240px]">
+              <SelectTrigger className="w-[260px]">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent className="bg-background">
