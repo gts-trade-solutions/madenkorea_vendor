@@ -36,6 +36,9 @@ const supabase = createClient(
   { auth: { persistSession: true, autoRefreshToken: true } }
 );
 
+const MAX_BATCH_UNITS = 100;
+const MAX_SUFFIX = 999;
+
 function toYmd(d: Date) {
   const x = new Date(d);
   x.setHours(0, 0, 0, 0);
@@ -68,6 +71,62 @@ function first2Letters(name: string) {
 
 function rand4() {
   return String(Math.floor(Math.random() * 10000)).padStart(4, "0");
+}
+
+function clampInt(v: any, min: number, max: number) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return min;
+  return Math.min(max, Math.max(min, Math.floor(n)));
+}
+
+function parseSuffixNumber(unitCode: string) {
+  // expects "...-001" style, but we accept any trailing digits after last "-"
+  const i = unitCode.lastIndexOf("-");
+  if (i < 0) return null;
+  const suffix = unitCode.slice(i + 1).trim();
+  if (!/^\d+$/.test(suffix)) return null;
+  const num = Number.parseInt(suffix, 10);
+  return Number.isFinite(num) ? num : null;
+}
+
+async function getNextSequenceStart(args: {
+  vendorId: string;
+  productId: string;
+  batchBaseCode: string;
+}) {
+  const { vendorId, productId, batchBaseCode } = args;
+
+  // Find max suffix among existing rows matching this base code.
+  // We page through results to be safe.
+  let maxFound = 0;
+  const pageSize = 1000;
+  let offset = 0;
+
+  // Hard stop to avoid runaway loops in worst-case datasets
+  const HARD_CAP = 20000;
+
+  while (offset < HARD_CAP) {
+    const { data, error } = await supabase
+      .from("inventory_units")
+      .select("unit_code")
+      .eq("vendor_id", vendorId)
+      .eq("product_id", productId)
+      .like("unit_code", `${batchBaseCode}-%`)
+      .range(offset, offset + pageSize - 1);
+
+    if (error) throw error;
+
+    const rows = (data ?? []) as Array<{ unit_code: string }>;
+    for (const r of rows) {
+      const n = parseSuffixNumber(r.unit_code);
+      if (n != null && n > maxFound) maxFound = n;
+    }
+
+    if (rows.length < pageSize) break;
+    offset += pageSize;
+  }
+
+  return maxFound + 1;
 }
 
 export function UnitUpsertDialog({
@@ -115,6 +174,10 @@ export function UnitUpsertDialog({
   // batch count (create)
   const [unitsCount, setUnitsCount] = useState<number>(1);
 
+  // next sequence (create)
+  const [nextSeqStart, setNextSeqStart] = useState<number>(1);
+  const [loadingSeq, setLoadingSeq] = useState(false);
+
   // Load on open
   useEffect(() => {
     if (!open) return;
@@ -138,10 +201,10 @@ export function UnitUpsertDialog({
         setExpiryDate(toYmd(addYears(today, 2)));
         setUnitsCount(1);
 
-        // product: MUST prefer price
+        // product
         const { data: p, error: pErr } = await supabase
           .from("products")
-          .select("id,name,product_code,price,price,brand_id")
+          .select("id,name,product_code,price,brand_id")
           .eq("id", productId)
           .single();
 
@@ -156,13 +219,7 @@ export function UnitUpsertDialog({
         setProductCode(pCode);
 
         const sp = (p as any)?.price;
-        const pr = (p as any)?.price;
-
-        // Use price (as requested). If missing, fallback to price but warn.
-        if (sp == null) {
-          toast.warning("price is null for this product. Using price as fallback.");
-        }
-        const final = sp != null ? Number(sp) : Number(pr ?? 0);
+        const final = sp != null ? Number(sp) : 0;
         setSalePrice(Number.isFinite(final) ? final : 0);
 
         // brand
@@ -198,46 +255,120 @@ export function UnitUpsertDialog({
 
   // base code for create (batch)
   const batchBaseCode = useMemo(() => {
-    if (!productCode || !brandCode || !manufactureDate || !expiryDate) return "";
+    if (!productCode || !brandCode || !manufactureDate || !expiryDate)
+      return "";
     const mfg = ymdToCompact(manufactureDate);
     const exp = ymdToCompact(expiryDate);
-    const pr = priceToCodePart(salePrice); // uses SALE PRICE (not editable)
+    const pr = priceToCodePart(salePrice);
     return `${productCode}${brandCode}${mfg}${exp}${pr}`;
   }, [productCode, brandCode, manufactureDate, expiryDate, salePrice]);
 
+  // compute next sequence start whenever base changes (create mode only)
+  useEffect(() => {
+    if (!open || isEdit) return;
+    if (!vendorId || !productId || !batchBaseCode) {
+      setNextSeqStart(1);
+      return;
+    }
+
+    let alive = true;
+    (async () => {
+      setLoadingSeq(true);
+      try {
+        const next = await getNextSequenceStart({
+          vendorId,
+          productId,
+          batchBaseCode,
+        });
+        if (alive) setNextSeqStart(next);
+      } catch (e: any) {
+        console.error(e);
+        if (alive) setNextSeqStart(1);
+        toast.error(e?.message || "Failed to check existing batch numbers");
+      } finally {
+        if (alive) setLoadingSeq(false);
+      }
+    })();
+
+    return () => {
+      alive = false;
+    };
+  }, [open, isEdit, vendorId, productId, batchBaseCode]);
+
   const previewCodes = useMemo(() => {
     if (!batchBaseCode) return [];
-    const n = Math.min(Math.max(Math.floor(unitsCount || 1), 1), 3);
-    return Array.from({ length: n }).map((_, i) => `${batchBaseCode}-${pad3(i + 1)}`);
-  }, [batchBaseCode, unitsCount]);
+    const count = clampInt(unitsCount || 1, 1, MAX_BATCH_UNITS);
+    const n = Math.min(count, 3);
+    const start = Math.max(1, nextSeqStart || 1);
+    return Array.from({ length: n }).map(
+      (_, i) => `${batchBaseCode}-${pad3(start + i)}`
+    );
+  }, [batchBaseCode, unitsCount, nextSeqStart]);
 
   // Create batch
   const createBatch = async () => {
     if (!vendorId || !productId) return;
 
-    const count = Math.max(1, Math.floor(unitsCount || 1));
+    const count = clampInt(unitsCount || 1, 1, MAX_BATCH_UNITS);
 
-    if (!batchBaseCode) return toast.error("Unit code not ready. Please check dates/codes.");
+    if (!batchBaseCode)
+      return toast.error("Unit code not ready. Please check dates/codes.");
     if (!manufactureDate) return toast.error("Manufacture date is required.");
     if (!expiryDate) return toast.error("Expiry date is required.");
 
     setSaving(true);
     try {
+      // Always recompute right before insert to avoid stale sequence
+      const start = await getNextSequenceStart({
+        vendorId,
+        productId,
+        batchBaseCode,
+      });
+
+      if (start + count - 1 > MAX_SUFFIX) {
+        toast.error(
+          `Cannot create ${count} units. Sequence would exceed ${MAX_SUFFIX} (starting at ${start}).`
+        );
+        return;
+      }
+
       const rows = Array.from({ length: count }).map((_, i) => ({
         vendor_id: vendorId,
         product_id: productId,
-        unit_code: `${batchBaseCode}-${pad3(i + 1)}`,
+        unit_code: `${batchBaseCode}-${pad3(start + i)}`,
         manufacture_date: manufactureDate,
         expiry_date: expiryDate,
-        // keep price stored but NOT editable; set from price
         price: salePrice,
         status: "IN_STOCK" as InventoryStatus,
       }));
 
-      const { error } = await supabase.from("inventory_units").insert(rows);
-      if (error) throw error;
+      // Simple retry-on-duplicate (in case of concurrent inserts)
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        const { error } = await supabase.from("inventory_units").insert(rows);
+        if (!error) break;
 
-      toast.success(`Created ${count} unit(s)`);
+        // 23505 is Postgres unique_violation (if you have unique constraint on vendor_id+unit_code)
+        const code = (error as any)?.code;
+        if (attempt === 1 && code === "23505") {
+          // Rebuild codes with a fresh start index and retry once
+          const retryStart = await getNextSequenceStart({
+            vendorId,
+            productId,
+            batchBaseCode,
+          });
+          if (retryStart + count - 1 > MAX_SUFFIX) {
+            throw error;
+          }
+          for (let i = 0; i < rows.length; i++) {
+            rows[i].unit_code = `${batchBaseCode}-${pad3(retryStart + i)}`;
+          }
+          continue;
+        }
+
+        throw error;
+      }
+
+      toast.success(`Created ${count} unit(s) (starting from ${pad3(start)})`);
       onSaved();
       onOpenChange(false);
     } catch (e: any) {
@@ -269,7 +400,9 @@ export function UnitUpsertDialog({
           .limit(1);
 
         if (dup && dup.length > 0) {
-          toast.error("This unit code already exists. Please use a unique unit code.");
+          toast.error(
+            "This unit code already exists. Please use a unique unit code."
+          );
           return;
         }
       }
@@ -277,11 +410,11 @@ export function UnitUpsertDialog({
       const { error } = await supabase
         .from("inventory_units")
         .update({
-          unit_code: nextUnitCode, // ✅ now editable
+         
           manufacture_date: manufactureDate,
           expiry_date: expiryDate || null,
           status: editStatus,
-          // ❌ no price update here
+          // no price update here (as per your current flow)
         })
         .eq("id", initial.id)
         .eq("vendor_id", vendorId);
@@ -303,18 +436,20 @@ export function UnitUpsertDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>{isEdit ? "Edit Unit" : "Create Unit Batch"}</DialogTitle>
+          <DialogTitle>
+            {isEdit ? "Edit Unit" : "Create Unit Batch"}
+          </DialogTitle>
         </DialogHeader>
 
         {isEdit ? (
           <div className="space-y-4">
             <div>
               <div className="text-sm font-medium mb-1">Unit code</div>
-              <Input
-                value={unitCode}
-                onChange={(e) => setUnitCode(e.target.value)}
-                placeholder="Enter unit code"
-              />
+              <Input value={unitCode} readOnly disabled />
+              <div className="text-xs text-muted-foreground mt-1">
+                Unit code cannot be edited after creation.
+              </div>
+
               <div className="text-xs text-muted-foreground mt-1">
                 Must be unique per vendor.
               </div>
@@ -341,7 +476,10 @@ export function UnitUpsertDialog({
 
             <div>
               <div className="text-sm font-medium mb-1">Status</div>
-              <Select value={editStatus} onValueChange={(v) => setEditStatus(v as InventoryStatus)}>
+              <Select
+                value={editStatus}
+                onValueChange={(v) => setEditStatus(v as InventoryStatus)}
+              >
                 <SelectTrigger className="w-full">
                   <SelectValue placeholder="Select status" />
                 </SelectTrigger>
@@ -351,28 +489,36 @@ export function UnitUpsertDialog({
                   <SelectItem value="DEMO">DEMO</SelectItem>
                   <SelectItem value="SOLD">SOLD</SelectItem>
                   <SelectItem value="RETURNED">RETURNED</SelectItem>
-                  <SelectItem value="OUT_OF_STOCK">OUT_OF_STOCK</SelectItem>
+
+                  {/* If you want to hide OUT_OF_STOCK everywhere on this page, keep it removed */}
+                  {/* <SelectItem value="OUT_OF_STOCK">OUT_OF_STOCK</SelectItem> */}
                 </SelectContent>
               </Select>
             </div>
-
-            {/* ✅ price removed from edit */}
           </div>
         ) : (
           <div className="space-y-4">
             <div className="grid grid-cols-2 gap-3">
               <div>
-                <div className="text-sm font-medium mb-1">Product Code (auto)</div>
+                <div className="text-sm font-medium mb-1">
+                  Product Code (auto)
+                </div>
                 <Input value={productCode} readOnly placeholder="Loading…" />
                 {productName ? (
-                  <div className="text-xs text-muted-foreground mt-1">{productName}</div>
+                  <div className="text-xs text-muted-foreground mt-1">
+                    {productName}
+                  </div>
                 ) : null}
               </div>
               <div>
-                <div className="text-sm font-medium mb-1">Brand Code (auto)</div>
+                <div className="text-sm font-medium mb-1">
+                  Brand Code (auto)
+                </div>
                 <Input value={brandCode} readOnly placeholder="Loading…" />
                 {brandName ? (
-                  <div className="text-xs text-muted-foreground mt-1">{brandName}</div>
+                  <div className="text-xs text-muted-foreground mt-1">
+                    {brandName}
+                  </div>
                 ) : null}
               </div>
             </div>
@@ -402,30 +548,45 @@ export function UnitUpsertDialog({
               </div>
             </div>
 
-            {/* ✅ price shown (read-only) but not editable */}
             <div>
               <div className="text-sm font-medium mb-1">Sale price (auto)</div>
-              <Input value={Number.isFinite(salePrice) ? String(salePrice) : "0"} readOnly />
+              <Input
+                value={Number.isFinite(salePrice) ? String(salePrice) : "0"}
+                readOnly
+              />
               <div className="text-xs text-muted-foreground mt-1">
-                Fetched from products.price (fallback to price if missing).
+                Used to generate code + saved into inventory_units.price
               </div>
             </div>
 
             <div className="grid grid-cols-2 gap-3">
               <div>
-                <div className="text-sm font-medium mb-1">Units count (batch)</div>
+                <div className="text-sm font-medium mb-1">
+                  Units count (batch)
+                </div>
                 <Input
                   type="number"
                   value={unitsCount}
-                  onChange={(e) => setUnitsCount(Number(e.target.value))}
-                  min="1"
+                  min={1}
+                  max={MAX_BATCH_UNITS}
+                  onChange={(e) =>
+                    setUnitsCount(clampInt(e.target.value, 1, MAX_BATCH_UNITS))
+                  }
                 />
-                <div className="text-xs text-muted-foreground mt-1">Example: 10</div>
+                <div className="text-xs text-muted-foreground mt-1">
+                  Max {MAX_BATCH_UNITS} per batch.
+                </div>
               </div>
 
               <div>
-                <div className="text-sm font-medium mb-1">Batch Base Code (auto)</div>
-                <Input value={batchBaseCode} readOnly placeholder="Auto-generated" />
+                <div className="text-sm font-medium mb-1">
+                  Batch Base Code (auto)
+                </div>
+                <Input
+                  value={batchBaseCode}
+                  readOnly
+                  placeholder="Auto-generated"
+                />
                 <div className="text-xs text-muted-foreground mt-1">
                   product_code + brand_code + mfg + exp + price
                 </div>
@@ -434,16 +595,46 @@ export function UnitUpsertDialog({
 
             <div>
               <div className="text-sm font-medium mb-1">Unit code preview</div>
-              <div className="rounded-md border p-2 text-sm font-mono space-y-1">
+
+              <div className="rounded-md border p-3 text-sm font-mono">
                 {batchBaseCode ? (
-                  previewCodes.map((x) => <div key={x}>{x}</div>)
+                  loadingSeq ? (
+                    <div className="text-muted-foreground">
+                      Checking next sequence…
+                    </div>
+                  ) : (
+                    (() => {
+                      const count = Math.min(
+                        Math.max(Math.floor(unitsCount || 1), 1),
+                        100
+                      );
+                      const start = Math.max(1, nextSeqStart || 1);
+                      const end = start + count - 1;
+
+                      return (
+                        <div className="space-y-1">
+                          <div>
+                            {batchBaseCode}-{pad3(start)}{" "}
+                            <span className="font-sans text-muted-foreground">
+                              →
+                            </span>{" "}
+                            {batchBaseCode}-{pad3(end)}
+                          </div>
+                          <div className="text-xs font-sans text-muted-foreground">
+                            {count} unit(s)
+                          </div>
+                        </div>
+                      );
+                    })()
+                  )
                 ) : (
                   <div className="text-muted-foreground">Loading…</div>
                 )}
               </div>
-              <div className="text-xs text-muted-foreground mt-1">
-                Saved as BatchBaseCode-001, -002, ...
-              </div>
+
+              {/* <div className="text-xs text-muted-foreground mt-1">
+    Continues numbering automatically (e.g., -050 then next is -051).
+  </div> */}
             </div>
           </div>
         )}
@@ -458,7 +649,10 @@ export function UnitUpsertDialog({
               {saving ? "Saving…" : "Save"}
             </Button>
           ) : (
-            <Button onClick={createBatch} disabled={saving || loadingMeta || !batchBaseCode}>
+            <Button
+              onClick={createBatch}
+              disabled={saving || loadingMeta || !batchBaseCode}
+            >
               {saving ? "Creating…" : "Create units"}
             </Button>
           )}

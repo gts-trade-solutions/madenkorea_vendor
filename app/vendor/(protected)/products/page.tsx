@@ -61,6 +61,9 @@ type ProductRow = {
   brands?: { name?: string | null } | null;
 };
 
+
+
+
 type BrandOption = { id: string; name: string };
 
 type UnitSummary = {
@@ -161,6 +164,41 @@ export default function VendorProductsPage() {
 
   // low stock flag based on IN_STOCK units
   const lowStockThreshold = 5;
+
+// ✅ Find product_ids by searching inventory_units (supports different column names safely)
+const findProductIdsByUnitSearch = async (term: string) => {
+  if (!vendor?.id) return [];
+
+  const s = term.trim();
+  if (!s) return [];
+
+  const like = `%${s}%`;
+
+  // Try common column names one-by-one.
+  // If a column doesn't exist in your DB, Supabase returns an error — we ignore and continue.
+  const candidateCols = ["unit_code", "barcode", "qr_code", "serial_no"];
+
+  const out = new Set<string>();
+
+  for (const col of candidateCols) {
+    const { data, error } = await supabase
+      .from("inventory_units")
+      .select("product_id")
+      .eq("vendor_id", vendor.id)
+
+      .ilike(col as any, like)
+      .limit(500);
+
+    if (error) continue;
+
+    (data ?? []).forEach((r: any) => {
+      if (r?.product_id) out.add(String(r.product_id));
+    });
+  }
+
+  return Array.from(out);
+};
+
 
   // ---------------- auth / vendor gate ----------------
   useEffect(() => {
@@ -316,12 +354,18 @@ export default function VendorProductsPage() {
         .eq("vendor_id", vendor.id);
 
       const s = debouncedSearch.trim();
-      if (s) {
-        // name OR slug search (fast + stable)
-        q = q.or(`name.ilike.%${s}%,slug.ilike.%${s}%`);
-        // If you want brand-name search in DB too, we can do it with an inner join,
-        // but it's a bit finicky in PostgREST; keep it simple for now.
-      }
+if (s) {
+  // ✅ search products by name/slug OR by matching units (barcode/unit_code/etc.)
+  const unitProductIds = await findProductIdsByUnitSearch(s);
+
+  if (unitProductIds.length > 0) {
+    // PostgREST "in" syntax needs parentheses
+    const inList = unitProductIds.join(",");
+    q = q.or(`name.ilike.%${s}%,slug.ilike.%${s}%,id.in.(${inList})`);
+  } else {
+    q = q.or(`name.ilike.%${s}%,slug.ilike.%${s}%`);
+  }
+}
 
       if (brandId !== "ALL") {
         q = q.eq("brand_id", brandId);

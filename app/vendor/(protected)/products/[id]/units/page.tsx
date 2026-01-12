@@ -3,7 +3,14 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { createClient } from "@supabase/supabase-js";
-import { toast } from "sonner";
+import "./page.css";
+
+// ✅ Toastify (replace sonner)
+import { toast, ToastContainer } from "react-toastify";
+import "react-toastify/dist/ReactToastify.css";
+
+// ✅ PDF generation
+import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
 
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -41,11 +48,24 @@ import {
 
 import { UnitUpsertDialog } from "./UnitUpsert";
 
+/**
+ * NOTE (DB):
+ * If you want audit to store deleted_units + skipped_verified_units, run once:
+ *
+ * alter table public.inventory_units_bulk_delete_audit
+ *   add column if not exists deleted_units int;
+ *
+ * alter table public.inventory_units_bulk_delete_audit
+ *   add column if not exists skipped_verified_units int;
+ */
+
 type VendorInfo = {
   id: string;
   display_name: string;
   status: "pending" | "approved" | "rejected" | "disabled";
 };
+
+type InvoicePrintType = "CUSTOMER" | "ADMIN";
 
 type ProductRow = {
   id: string;
@@ -70,9 +90,52 @@ type UnitRow = {
   expiry_date: string | null;
   status: InventoryStatus;
   created_at: string;
-  price?: number | null; // ✅ unit price
+  price?: number | null;
   sold_customer_name?: string | null;
   sold_customer_phone?: string | null;
+  // ✅ verified lock
+  is_verified?: boolean | null;
+  verified_at?: string | null;
+};
+
+// ✅ STATIC OVERRIDE AUTH (frontend-only gate)
+// You can hardcode OR use NEXT_PUBLIC_* envs.
+const OVERRIDE_USERNAME = process.env.NEXT_PUBLIC_OVERRIDE_USERNAME || "admin";
+const OVERRIDE_PASSWORD =
+  process.env.NEXT_PUBLIC_OVERRIDE_PASSWORD || "admin@123";
+
+function checkStaticOverride(username: string, password: string) {
+  const u = (username || "").trim();
+  const p = password || "";
+  return u === OVERRIDE_USERNAME && p === OVERRIDE_PASSWORD;
+}
+
+type InvoiceCompanyRow = {
+  id: string;
+  key: "GTS" | "NEMO" | "KORMART";
+  display_name: string;
+  legal_name: string | null;
+  address: string | null;
+  gst_number: string | null;
+  pan_number: string | null;
+  phone: string | null;
+  email: string | null;
+  bank_name: string | null;
+  bank_branch: string | null;
+  account_number: string | null;
+  ifsc_code: string | null;
+  swift_code: string | null;
+};
+
+type InvoiceDraftItem = {
+  id: string; // client id
+  unit_id?: string; // optional tracking (not stored in DB)
+  description: string;
+  hsn_sac: string;
+  quantity: number;
+  unit_price: number;
+  discount: number;
+  tax_percent: number;
 };
 
 type CustomerRow = {
@@ -82,6 +145,310 @@ type CustomerRow = {
   email: string | null;
   address: string | null;
 };
+
+function safe(s?: string | null) {
+  return String(s ?? "").trim();
+}
+
+function wrapText(text: string, maxChars: number) {
+  const t = safe(text);
+  if (!t) return [""];
+  const words = t.split(/\s+/);
+  const lines: string[] = [];
+  let cur = "";
+  for (const w of words) {
+    const next = cur ? `${cur} ${w}` : w;
+    if (next.length > maxChars) {
+      if (cur) lines.push(cur);
+      cur = w;
+    } else cur = next;
+  }
+  if (cur) lines.push(cur);
+  return lines.length ? lines : [t];
+}
+
+async function buildInvoicePdfLikeAttachment2(args: {
+  company: InvoiceCompanyRow | null;
+  invoiceNo: string;
+  invoiceDate: string;
+  customerName: string;
+  billingAddress: string;
+  phone: string;
+  email: string;
+  customerGstin: string;
+  customerPan: string;
+  items: InvoiceDraftItem[];
+  taxLabel: string;
+  notes: string;
+}) {
+  const pdfDoc = await PDFDocument.create();
+  const page = pdfDoc.addPage([595.28, 841.89]); // A4
+  const { width, height } = page.getSize();
+
+  const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+  const bold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+
+  const margin = 48;
+  let y = height - margin;
+
+  const line = (yy: number) => {
+    page.drawLine({
+      start: { x: margin, y: yy },
+      end: { x: width - margin, y: yy },
+      thickness: 1,
+    });
+  };
+
+  const text = (
+    t: string,
+    x: number,
+    yy: number,
+    size = 10,
+    isBold = false
+  ) => {
+    page.drawText(safe(t), { x, y: yy, size, font: isBold ? bold : font });
+  };
+
+  // ---------- Calculate totals ----------
+  let subtotal = 0;
+  let taxTotal = 0;
+  let grandTotal = 0;
+
+  const rows = args.items.map((it) => {
+    const qty = Math.max(1, Number(it.quantity || 1));
+    const rate = Math.max(0, Number(it.unit_price || 0));
+    const disc = Math.max(0, Number(it.discount || 0));
+    const base = Math.max(qty * rate - disc, 0);
+    const tax =
+      Math.round(base * (Number(it.tax_percent || 0) / 100) * 100) / 100;
+    const amount = base + tax;
+    subtotal += base;
+    taxTotal += tax;
+    grandTotal += amount;
+    return { ...it, qty, rate, disc, base, tax, amount };
+  });
+
+  subtotal = Math.round(subtotal * 100) / 100;
+  taxTotal = Math.round(taxTotal * 100) / 100;
+  grandTotal = Math.round(grandTotal * 100) / 100;
+
+  // ---------- Header ----------
+  const comp = args.company;
+
+  text(
+    safe(comp?.display_name || comp?.legal_name || "Company"),
+    margin,
+    y,
+    13,
+    true
+  );
+  y -= 18;
+  if (
+    safe(comp?.legal_name) &&
+    safe(comp?.legal_name) !== safe(comp?.display_name)
+  ) {
+    text(safe(comp?.legal_name), margin, y, 9, false);
+    y -= 14;
+  }
+  if (safe(comp?.email)) {
+    text(`Support Email: ${safe(comp?.email)}`, margin, y, 9, false);
+    y -= 14;
+  }
+
+  // Right side header
+  text("INVOICE", width - margin - 80, height - margin, 12, true);
+  text(
+    `Invoice No: ${args.invoiceNo}`,
+    width - margin - 180,
+    height - margin - 18,
+    10,
+    false
+  );
+  text(
+    `Invoice Date: ${args.invoiceDate}`,
+    width - margin - 180,
+    height - margin - 34,
+    10,
+    false
+  );
+
+  // Divider
+  y -= 8;
+  line(y);
+  y -= 24;
+
+  // ---------- Bill To + Invoice Info ----------
+  const leftX = margin;
+  const rightX = width / 2 + 10;
+
+  text("Bill To", leftX, y, 10, true);
+  text("Invoice Info", rightX, y, 10, true);
+  y -= 16;
+
+  // Bill To details (left)
+  const billLines: string[] = [];
+  billLines.push(safe(args.customerName) || "-");
+  if (safe(args.billingAddress))
+    billLines.push(...wrapText(args.billingAddress, 42));
+  if (safe(args.phone)) billLines.push(`Phone: ${safe(args.phone)}`);
+  if (safe(args.customerGstin))
+    billLines.push(`GSTIN: ${safe(args.customerGstin)}`);
+  if (safe(args.customerPan)) billLines.push(`PAN: ${safe(args.customerPan)}`);
+
+  let billY = y;
+  for (const bl of billLines) {
+    text(bl, leftX, billY, 9, false);
+    billY -= 13;
+  }
+
+  // Invoice info (right)
+  const infoLines: string[] = [];
+  if (safe(args.email)) infoLines.push(`Customer Email: ${safe(args.email)}`);
+  // if (safe(comp?.gst_number)) infoLines.push(`Seller GSTIN: ${safe(comp?.gst_number)}`);
+  if (safe(comp?.pan_number))
+    infoLines.push(`Seller PAN: ${safe(comp?.pan_number)}`);
+
+  let infoY = y;
+  for (const il of infoLines) {
+    text(il, rightX, infoY, 9, false);
+    infoY -= 13;
+  }
+
+  y = Math.min(billY, infoY) - 14;
+  line(y);
+  y -= 22;
+
+  // ---------- Items Table ----------
+  // Column layout (like your attachment)
+  const tableX = margin;
+  const tableW = width - margin * 2;
+
+  const cols = {
+    no: tableX + 0,
+    desc: tableX + 30,
+    hsn: tableX + 250,
+    qty: tableX + 340,
+    unit: tableX + 410,
+    tax: tableX + 485,
+    amt: tableX + 540,
+  };
+
+  // Header row (no fill, just bold)
+  text("#", cols.no + 2, y, 9, true);
+  text("Description", cols.desc, y, 9, true);
+  text("HSN/SAC", cols.hsn, y, 9, true);
+  text("Qty", cols.qty, y, 9, true);
+  text("Unit Price", cols.unit, y, 9, true);
+  text("Tax %", cols.tax, y, 9, true);
+  text("Amount", cols.amt, y, 9, true);
+
+  y -= 12;
+  line(y);
+  y -= 16;
+
+  // Rows
+  const rowGap = 14;
+  rows.forEach((r, idx) => {
+    // wrap description to 2 lines max
+    const dLines = wrapText(r.description, 36).slice(0, 2);
+
+    text(String(idx + 1), cols.no + 4, y, 9, false);
+    text(dLines[0] || "", cols.desc, y, 9, false);
+    if (dLines[1]) text(dLines[1], cols.desc, y - 12, 9, false);
+
+    text(safe(r.hsn_sac || ""), cols.hsn, y, 9, false);
+    text(String(r.qty), cols.qty, y, 9, false);
+    text(money(r.rate), cols.unit, y, 9, false);
+    text(money(Number(r.tax_percent || 0)), cols.tax, y, 9, false);
+    text(money(r.amount), cols.amt, y, 9, false);
+
+    // move y depending on wrapped line
+    y -= dLines[1] ? rowGap + 12 : rowGap;
+
+    // Stop if near bottom (simple guard)
+    if (y < margin + 200) return;
+  });
+
+  y -= 8;
+  line(y);
+  y -= 18;
+
+  // ---------- Totals (right aligned block) ----------
+  const totalsX = width - margin - 170;
+  const labelX = totalsX;
+  const valX = width - margin;
+
+  const rightText = (
+    t: string,
+    x: number,
+    yy: number,
+    size = 10,
+    isBold = false
+  ) => {
+    const w = (isBold ? bold : font).widthOfTextAtSize(t, size);
+    page.drawText(t, { x: x - w, y: yy, size, font: isBold ? bold : font });
+  };
+
+  rightText("Subtotal", valX - 70, y, 10, false);
+  rightText(money(subtotal), valX, y, 10, false);
+  y -= 14;
+
+  rightText(args.taxLabel || "Tax", valX - 70, y, 10, false);
+  rightText(money(taxTotal), valX, y, 10, false);
+  y -= 16;
+
+  rightText("Total", valX - 70, y, 11, true);
+  rightText(money(grandTotal), valX, y, 11, true);
+
+  y -= 30;
+  line(y);
+  y -= 18;
+
+  // ---------- Notes + Disclaimer + Return policy ----------
+  text("Notes", margin, y, 10, true);
+  y -= 14;
+
+  const notesLines = wrapText(args.notes || "", 85);
+  notesLines.slice(0, 4).forEach((nl) => {
+    text(nl, margin, y, 9, false);
+    y -= 13;
+  });
+
+  y -= 10;
+
+  const disclaimer = [
+    "Reseller Disclaimer",
+    "We are resellers and are not responsible for product usage or handling guidance.",
+    "For detailed information on how to use the product safely and effectively, please contact the product manufacturer directly.",
+    "",
+    "Return Policy",
+    "• Returns are accepted within 5 days from the date of delivery.",
+    "• Returns are only accepted for products with damaged packaging or expired items.",
+    "• Used products or items with broken or tampered seals are not eligible for return.",
+  ];
+
+  disclaimer.forEach((dl, i) => {
+    if (!dl) {
+      y -= 8;
+      return;
+    }
+    text(
+      dl,
+      margin,
+      y,
+      i === 0 || dl === "Return Policy" ? 9 : 8.8,
+      i === 0 || dl === "Return Policy"
+    );
+    y -= 12.5;
+  });
+
+  return await pdfDoc.save();
+}
+
+// ✅ Static override creds (FRONTEND only)
+const OVERRIDE_ADMIN_EMAIL = process.env.NEXT_PUBLIC_OVERRIDE_ADMIN_EMAIL || "";
+const OVERRIDE_ADMIN_PASSWORD =
+  process.env.NEXT_PUBLIC_OVERRIDE_ADMIN_PASSWORD || "";
 
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -101,6 +468,504 @@ function csvEscape(v: any) {
   return s;
 }
 
+function money(n: any) {
+  const x = Number(n ?? 0);
+  if (!Number.isFinite(x)) return "0.00";
+  return x.toFixed(2);
+}
+
+function safeFileName(name: string) {
+  return String(name || "invoice")
+    .replace(/[^\w\-]+/g, "_")
+    .slice(0, 80);
+}
+
+// ✅ Reliable: download PDF without popups
+function downloadPdfBytes(bytes: Uint8Array, filename: string) {
+  const blob = new Blob([bytes], { type: "application/pdf" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+// ✅ Reliable: print PDF via hidden iframe (no blank popup)
+function printPdfBytes(bytes: Uint8Array) {
+  const blob = new Blob([bytes], { type: "application/pdf" });
+  const url = URL.createObjectURL(blob);
+
+  const iframe = document.createElement("iframe");
+  iframe.style.position = "fixed";
+  iframe.style.right = "0";
+  iframe.style.bottom = "0";
+  iframe.style.width = "0";
+  iframe.style.height = "0";
+  iframe.style.border = "0";
+  iframe.src = url;
+
+  document.body.appendChild(iframe);
+
+  iframe.onload = () => {
+    try {
+      iframe.contentWindow?.focus();
+      iframe.contentWindow?.print();
+    } finally {
+      setTimeout(() => {
+        URL.revokeObjectURL(url);
+        iframe.remove();
+      }, 1500);
+    }
+  };
+}
+
+type DraftInvoiceForPdf = {
+  invoiceNumber: string;
+  invoiceDate: string;
+
+  companyName: string;
+  companyAddress?: string;
+  companyGst?: string;
+  companyPan?: string;
+
+  customerName: string;
+  customerPhone?: string;
+  customerEmail?: string;
+  billingAddress?: string;
+
+  taxLabel: string;
+  notes?: string;
+
+  items: Array<{
+    description: string;
+    hsn_sac?: string | null;
+    quantity: number;
+    unit_price: number;
+    discount: number;
+    tax_percent: number;
+  }>;
+
+  subtotal: number;
+  tax: number;
+  total: number;
+};
+
+// ✅ Simple A4 PDF matching your current fields (no popup HTML)
+// ✅ Polished A4 PDF (table + borders + wrapping + pagination)
+async function buildInvoicePdfFromDraft(d: DraftInvoiceForPdf) {
+  const pdfDoc = await PDFDocument.create();
+
+  const PAGE_W = 595.28;
+  const PAGE_H = 841.89;
+  const M = 40; // margin
+
+  const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+  const bold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+
+  const fmtMoney = (n: any) => {
+    const x = Number(n ?? 0);
+    if (!Number.isFinite(x)) return "0.00";
+    return x.toFixed(2);
+  };
+
+  const wrapText = (text: string, maxWidth: number, f: any, size: number) => {
+    const words = String(text ?? "")
+      .split(/\s+/)
+      .filter(Boolean);
+    const lines: string[] = [];
+    let cur = "";
+
+    for (const w of words) {
+      const test = cur ? `${cur} ${w}` : w;
+      const width = f.widthOfTextAtSize(test, size);
+      if (width <= maxWidth) cur = test;
+      else {
+        if (cur) lines.push(cur);
+        cur = w;
+      }
+    }
+    if (cur) lines.push(cur);
+    return lines.length ? lines : [""];
+  };
+
+  const drawBox = (
+    page: any,
+    x: number,
+    y: number,
+    w: number,
+    h: number,
+    opts?: { border?: boolean; borderWidth?: number }
+  ) => {
+    if (!opts?.border) return;
+
+    page.drawRectangle({
+      x,
+      y,
+      width: w,
+      height: h,
+      borderWidth: opts.borderWidth ?? 1,
+      // ✅ NO color / borderColor
+    });
+  };
+
+  const drawText = (
+    page: any,
+    text: string,
+    x: number,
+    y: number,
+    size: number,
+    f: any,
+    opts?: { maxWidth?: number }
+  ) => {
+    const s = String(text ?? "");
+    if (!opts?.maxWidth) {
+      page.drawText(s, { x, y, size, font: f, color: rgb(0.98, 0.98, 0.98) });
+      return;
+    }
+    const lines = wrapText(s, opts.maxWidth, f, size);
+    let yy = y;
+    for (const line of lines) {
+      page.drawText(line, {
+        x,
+        y: yy,
+        size,
+        font: f,
+        color: rgb(0.98, 0.98, 0.98),
+      });
+      yy -= size + 2;
+    }
+  };
+
+  // ---- Table columns (sum should fit within page width - margins) ----
+  const tableX = M;
+  const tableW = PAGE_W - M * 2;
+
+  // Columns: # | Description | HSN | Qty | Rate | Disc | Tax% | Amount
+  const COLS = [
+    { key: "sn", w: 26, align: "left" as const },
+    { key: "desc", w: 232, align: "left" as const },
+    { key: "hsn", w: 54, align: "left" as const },
+    { key: "qty", w: 34, align: "right" as const },
+    { key: "rate", w: 58, align: "right" as const },
+    { key: "disc", w: 56, align: "right" as const },
+    { key: "tax", w: 44, align: "right" as const },
+    { key: "amt", w: 76, align: "right" as const },
+  ];
+  const colSum = COLS.reduce((a, c) => a + c.w, 0);
+  const scale = tableW / colSum;
+  const cols = COLS.map((c) => ({ ...c, w: c.w * scale }));
+
+  const headerFill = rgb(0.93, 0.93, 0.93);
+  const borderColor = rgb(0.75, 0.75, 0.75);
+
+  const makePage = () => pdfDoc.addPage([PAGE_W, PAGE_H]);
+
+  let page = makePage();
+  let y = PAGE_H - M;
+
+  const drawTopHeader = () => {
+    // Title
+    page.drawText("TAX INVOICE", { x: M, y: y - 8, size: 18, font: bold });
+    page.drawLine({
+      start: { x: M, y: y - 14 },
+      end: { x: PAGE_W - M, y: y - 14 },
+      thickness: 1,
+    });
+
+    // Invoice meta (top-right)
+    page.drawText(`Invoice No: ${d.invoiceNumber}`, {
+      x: PAGE_W - M - 250,
+      y: y - 6,
+      size: 10,
+      font,
+    });
+    page.drawText(`Invoice Date: ${d.invoiceDate}`, {
+      x: PAGE_W - M - 250,
+      y: y - 20,
+      size: 10,
+      font,
+    });
+
+    y -= 36;
+
+    // Seller + Bill-to boxes
+    const boxH = 92;
+    const gap = 12;
+    const boxW = (PAGE_W - M * 2 - gap) / 2;
+
+    // Seller box
+    drawBox(page, M, y - boxH, boxW, boxH, { border: true });
+    page.drawText("Seller", { x: M + 10, y: y - 16, size: 11, font: bold });
+
+    let sy = y - 32;
+    drawText(page, d.companyName || "-", M + 10, sy, 10, bold, {
+      maxWidth: boxW - 20,
+    });
+    sy -= 14;
+
+    if (d.companyAddress) {
+      drawText(page, d.companyAddress, M + 10, sy, 9, font, {
+        maxWidth: boxW - 20,
+      });
+      // estimate lines used
+      const lines = wrapText(d.companyAddress, boxW - 20, font, 9);
+      sy -= lines.length * (9 + 2) + 4;
+    }
+
+    page.drawText(`GST: ${d.companyGst || "-"}`, {
+      x: M + 10,
+      y: sy,
+      size: 9,
+      font,
+    });
+    page.drawText(`PAN: ${d.companyPan || "-"}`, {
+      x: M + 150,
+      y: sy,
+      size: 9,
+      font,
+    });
+
+    // Bill-to box
+    const bx = M + boxW + gap;
+    drawBox(page, bx, y - boxH, boxW, boxH, { border: true });
+    page.drawText("Bill To", { x: bx + 10, y: y - 16, size: 11, font: bold });
+
+    let by = y - 32;
+    drawText(page, d.customerName || "-", bx + 10, by, 10, bold, {
+      maxWidth: boxW - 20,
+    });
+    by -= 14;
+
+    if (d.billingAddress) {
+      drawText(page, d.billingAddress, bx + 10, by, 9, font, {
+        maxWidth: boxW - 20,
+      });
+      const lines = wrapText(d.billingAddress, boxW - 20, font, 9);
+      by -= lines.length * (9 + 2) + 4;
+    }
+
+    page.drawText(`Phone: ${d.customerPhone || "-"}`, {
+      x: bx + 10,
+      y: by,
+      size: 9,
+      font,
+    });
+    page.drawText(`Email: ${d.customerEmail || "-"}`, {
+      x: bx + 170,
+      y: by,
+      size: 9,
+      font,
+    });
+
+    y -= boxH + 18;
+  };
+
+  const drawTableHeader = () => {
+    const h = 22;
+    drawBox(page, tableX, y - h, tableW, h, { fill: headerFill, border: true });
+
+    let cx = tableX;
+    const headers = [
+      "#",
+      "Description",
+      "HSN",
+      "Qty",
+      "Rate",
+      "Disc",
+      "Tax%",
+      "Amount",
+    ];
+
+    for (let i = 0; i < cols.length; i++) {
+      const col = cols[i];
+      // vertical line
+      if (i !== 0) {
+        page.drawLine({
+          start: { x: cx, y: y },
+          end: { x: cx, y: y - h },
+          thickness: 1,
+        });
+      }
+
+      page.drawText(headers[i], {
+        x: cx + 6,
+        y: y - 15,
+        size: 9,
+        font: bold,
+        color: rgb(0.98, 0.98, 0.98),
+      });
+
+      cx += col.w;
+    }
+
+    y -= h;
+  };
+
+  const ensureSpace = (needed: number) => {
+    // keep some space for totals + notes
+    const bottomSafe = M + 140;
+    if (y - needed < bottomSafe) {
+      page = makePage();
+      y = PAGE_H - M;
+      drawTopHeader();
+      drawTableHeader();
+    }
+  };
+
+  // ---- Build document ----
+  drawTopHeader();
+  drawTableHeader();
+
+  // Rows
+  const rowFontSize = 9;
+  const rowPadY = 6;
+
+  let rowIndex = 1;
+  for (const it of d.items) {
+    const qty = Number(it.quantity || 0);
+    const rate = Number(it.unit_price || 0);
+    const disc = Number(it.discount || 0);
+    const taxP = Number(it.tax_percent || 0);
+
+    const lineSub = Math.max(qty * rate - disc, 0);
+    const lineTax = Math.round(lineSub * (taxP / 100) * 100) / 100;
+    const lineTotal = lineSub + lineTax;
+
+    const descLines = wrapText(
+      String(it.description || ""),
+      cols[1].w - 12,
+      font,
+      rowFontSize
+    );
+    const rowH = Math.max(18, descLines.length * (rowFontSize + 2) + rowPadY);
+
+    ensureSpace(rowH);
+
+    // row outer box
+    drawBox(page, tableX, y - rowH, tableW, rowH, { border: true });
+
+    // vertical column lines + text
+    let cx = tableX;
+
+    const cellYTop = y - rowPadY - rowFontSize;
+
+    const drawCell = (
+      text: string,
+      colIdx: number,
+      align: "left" | "right",
+      lines?: string[]
+    ) => {
+      const col = cols[colIdx];
+      const left = cx;
+      const right = cx + col.w;
+
+      if (colIdx !== 0) {
+        page.drawLine({
+          start: { x: left, y },
+          end: { x: left, y: y - rowH },
+          thickness: 1,
+        });
+      }
+
+      if (colIdx === 1 && lines) {
+        // multi-line description
+        let yy = y - 6 - rowFontSize;
+        for (const ln of lines) {
+          page.drawText(ln, { x: left + 6, y: yy, size: rowFontSize, font });
+          yy -= rowFontSize + 2;
+        }
+      } else {
+        const s = String(text ?? "");
+        const textW = font.widthOfTextAtSize(s, rowFontSize);
+        const tx =
+          align === "right" ? Math.max(left + 6, right - 6 - textW) : left + 6;
+        page.drawText(s, { x: tx, y: cellYTop, size: rowFontSize, font });
+      }
+
+      cx += col.w;
+    };
+
+    drawCell(String(rowIndex), 0, "left");
+    drawCell("", 1, "left", descLines);
+    drawCell(String(it.hsn_sac ?? ""), 2, "left");
+    drawCell(String(qty || ""), 3, "right");
+    drawCell(fmtMoney(rate), 4, "right");
+    drawCell(fmtMoney(disc), 5, "right");
+    drawCell(String(taxP ? taxP.toFixed(0) : "0"), 6, "right");
+    drawCell(fmtMoney(lineTotal), 7, "right");
+
+    y -= rowH;
+    rowIndex += 1;
+  }
+
+  // Totals box
+  ensureSpace(120);
+
+  const totalsW = 230;
+  const totalsH = 76;
+  const totalsX = PAGE_W - M - totalsW;
+  const totalsY = y - 12;
+
+  drawBox(page, totalsX, totalsY - totalsH, totalsW, totalsH, {
+    border: true,
+    fill: { r: 0.98, g: 0.98, b: 0.98 },
+  });
+
+  const txL = totalsX + 12;
+  const txR = totalsX + totalsW - 12;
+
+  const drawRight = (
+    label: string,
+    value: string,
+    yy: number,
+    isBold = false
+  ) => {
+    page.drawText(label, {
+      x: txL,
+      y: yy,
+      size: 10,
+      font: isBold ? bold : font,
+    });
+    const w = (isBold ? bold : font).widthOfTextAtSize(value, 10);
+    page.drawText(value, {
+      x: txR - w,
+      y: yy,
+      size: 10,
+      font: isBold ? bold : font,
+    });
+  };
+
+  drawRight("Subtotal", fmtMoney(d.subtotal), totalsY - 22, true);
+
+  const taxLabel = (d.taxLabel || "Tax").trim() || "Tax";
+  drawRight(taxLabel, fmtMoney(d.tax), totalsY - 40, true);
+
+  page.drawLine({
+    start: { x: totalsX + 10, y: totalsY - 48 },
+    end: { x: totalsX + totalsW - 10, y: totalsY - 48 },
+    thickness: 1,
+  });
+
+  drawRight("Grand Total", fmtMoney(d.total), totalsY - 66, true);
+
+  y = totalsY - totalsH - 18;
+
+  // Notes
+  if (d.notes) {
+    ensureSpace(60);
+    page.drawText("Notes:", { x: M, y: y, size: 10, font: bold });
+    const lines = wrapText(d.notes, PAGE_W - M * 2, font, 9);
+    let ny = y - 14;
+    for (const ln of lines.slice(0, 6)) {
+      page.drawText(ln, { x: M, y: ny, size: 9, font });
+      ny -= 11;
+    }
+  }
+
+  return await pdfDoc.save();
+}
+
 export default function ProductUnitsPage({
   params,
 }: {
@@ -108,6 +973,35 @@ export default function ProductUnitsPage({
 }) {
   const router = useRouter();
   const productId = params.id;
+
+  const todayYmd = useMemo(() => toYmd(new Date()), []);
+  const [invoicePrintType, setInvoicePrintType] =
+    useState<InvoicePrintType>("CUSTOMER");
+  const [invSellerGstin, setInvSellerGstin] = useState("");
+  // ---------------- Invoice Create (single/multi) ----------------
+  const [invoiceOpen, setInvoiceOpen] = useState(false);
+  const [invoiceMode, setInvoiceMode] = useState<"SINGLE" | "MULTI">("SINGLE");
+  const [invoiceCompanies, setInvoiceCompanies] = useState<InvoiceCompanyRow[]>(
+    []
+  );
+  const [invoiceCompanyId, setInvoiceCompanyId] = useState<string>("");
+
+  const [invCustomerName, setInvCustomerName] = useState("");
+  const [invBillingAddress, setInvBillingAddress] = useState("");
+  const [invPhone, setInvPhone] = useState("");
+  const [invEmail, setInvEmail] = useState("");
+  const [invContactPerson, setInvContactPerson] = useState("");
+  const [invGstNumber, setInvGstNumber] = useState("");
+  const [invPanNumber, setInvPanNumber] = useState("");
+
+  const [invInvoiceDate, setInvInvoiceDate] = useState<string>(todayYmd);
+  // (kept for compatibility; not used in PDF now)
+  const [invDueDate, setInvDueDate] = useState<string>("");
+  const [invNotes, setInvNotes] = useState("");
+  const [invTaxLabel, setInvTaxLabel] = useState("GST");
+
+  const [invItems, setInvItems] = useState<InvoiceDraftItem[]>([]);
+  const [invWorking, setInvWorking] = useState(false);
 
   const [hydrated, setHydrated] = useState(false);
   const [ready, setReady] = useState(false);
@@ -130,6 +1024,8 @@ export default function ProductUnitsPage({
   const [mfgTo, setMfgTo] = useState<string>("");
   const [expFrom, setExpFrom] = useState<string>("");
   const [expTo, setExpTo] = useState<string>("");
+
+  // kept in logic
   const [includeNoExpiry, setIncludeNoExpiry] = useState<boolean>(true);
 
   // pagination
@@ -154,8 +1050,6 @@ export default function ProductUnitsPage({
 
   // applied-filters version (fetch only when apply)
   const [filtersVersion, setFiltersVersion] = useState(0);
-
-  const todayYmd = useMemo(() => toYmd(new Date()), []);
 
   // ---------------- Selection (for batch actions) ----------------
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -188,9 +1082,35 @@ export default function ProductUnitsPage({
   const [bulkDeleteConfirm, setBulkDeleteConfirm] = useState("");
   const [bulkDeleting, setBulkDeleting] = useState(false);
 
-  // ---------------- Bulk edit dialog ----------------
+  const [bulkDeleteAck, setBulkDeleteAck] = useState(false);
+  const [bulkDeleteName, setBulkDeleteName] = useState("");
 
-  const [bulkNewPrice, setBulkNewPrice] = useState<string>(""); // empty = no change
+  const [bulkDeleteVerifiedCount, setBulkDeleteVerifiedCount] = useState(0);
+  const [bulkDeleteMetaLoading, setBulkDeleteMetaLoading] = useState(false);
+
+  // Admin override fields (kept; auto-filled with static creds)
+  const [bulkDeleteAdminEmail, setBulkDeleteAdminEmail] = useState("");
+  const [bulkDeleteAdminPassword, setBulkDeleteAdminPassword] = useState("");
+
+  // ✅ bulk delete mode (if verified are in target)
+  const [bulkDeleteMode, setBulkDeleteMode] = useState<
+    "DELETE_ALL" | "SKIP_VERIFIED"
+  >("DELETE_ALL");
+
+  // ---------------- Bulk edit dialog ----------------
+  const [bulkEditOpen, setBulkEditOpen] = useState(false);
+  const [bulkEditScope, setBulkEditScope] = useState<"SELECTED" | "FILTERED">(
+    "SELECTED"
+  );
+  const [bulkEditing, setBulkEditing] = useState(false);
+
+  const [bulkNewStatus, setBulkNewStatus] = useState<
+    InventoryStatus | "NO_CHANGE"
+  >("NO_CHANGE");
+
+  // ✅ dates (empty = no change)
+  const [bulkNewMfgDate, setBulkNewMfgDate] = useState<string>("");
+  const [bulkNewExpDate, setBulkNewExpDate] = useState<string>("");
 
   // ---------------- SOLD customer dialog ----------------
   const [soldDialogOpen, setSoldDialogOpen] = useState(false);
@@ -207,20 +1127,42 @@ export default function ProductUnitsPage({
   const [custPhone, setCustPhone] = useState("");
   const [custEmail, setCustEmail] = useState("");
   const [custAddress, setCustAddress] = useState("");
+  const [userId, setUserId] = useState<string>("");
 
-  const [bulkEditOpen, setBulkEditOpen] = useState(false);
-  const [bulkEditScope, setBulkEditScope] = useState<"SELECTED" | "FILTERED">(
-    "SELECTED"
+  // ---------------- Admin override delete (single verified unit delete) ----------------
+  const [overrideDeleteOpen, setOverrideDeleteOpen] = useState(false);
+  const [overrideTarget, setOverrideTarget] = useState<UnitRow | null>(null);
+  const [overrideEmail, setOverrideEmail] = useState("");
+  const [overridePassword, setOverridePassword] = useState("");
+  const [overrideWorking, setOverrideWorking] = useState(false);
+
+  // ---------------- Status override (SOLD/RETURNED + SOLD lock) ----------------
+  const [statusOverrideOpen, setStatusOverrideOpen] = useState(false);
+  const [statusOverrideUnit, setStatusOverrideUnit] = useState<UnitRow | null>(
+    null
   );
-  const [bulkEditing, setBulkEditing] = useState(false);
+  const [statusOverrideNext, setStatusOverrideNext] =
+    useState<InventoryStatus | null>(null);
+  const [statusOverrideEmail, setStatusOverrideEmail] = useState("");
+  const [statusOverridePassword, setStatusOverridePassword] = useState("");
+  const [statusOverrideWorking, setStatusOverrideWorking] = useState(false);
 
-  const [bulkNewStatus, setBulkNewStatus] = useState<
-    InventoryStatus | "NO_CHANGE"
-  >("NO_CHANGE");
+  // gate so SOLD action must be admin-authorized
+  const [soldAuthOk, setSoldAuthOk] = useState(false);
 
-  // ✅ NEW: dates (empty = no change)
-  const [bulkNewMfgDate, setBulkNewMfgDate] = useState<string>("");
-  const [bulkNewExpDate, setBulkNewExpDate] = useState<string>(""); // allow empty string = "no change"
+  function createEphemeralAuthClient() {
+    return createClient(
+      process.env.NEXT_PUBLIC_SUPABASE_URL!,
+      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+      {
+        auth: {
+          persistSession: false,
+          autoRefreshToken: false,
+          detectSessionInUrl: false,
+        },
+      }
+    );
+  }
 
   // sort
   const [sortBy, setSortBy] = useState<
@@ -249,22 +1191,33 @@ export default function ProductUnitsPage({
     setCustAddress("");
   };
 
-  const openSoldDialogSingle = (u: UnitRow) => {
-    setSoldTargetUnit(u);
-    resetSoldForm();
+  const openStatusOverride = (u: UnitRow, next: InventoryStatus) => {
+    setStatusOverrideUnit(u);
+    setStatusOverrideNext(next);
 
-    if (u.sold_customer_name) setCustName(u.sold_customer_name ?? "");
-    if (u.sold_customer_phone) setCustPhone(u.sold_customer_phone ?? "");
+    // ✅ DO NOT autofill. Always blank.
+    setStatusOverrideEmail("");
+    setStatusOverridePassword("");
 
-    setSoldDialogOpen(true);
+    setStatusOverrideOpen(true);
   };
 
-  // ---------------- Scan modal (NEW) ----------------
+  const [invSellerPan, setInvSellerPan] = useState("");
+  // ---------------- Scan modal ----------------
   const [scanOpen, setScanOpen] = useState(false);
   const [scanValue, setScanValue] = useState("");
   const [scanLoading, setScanLoading] = useState(false);
   const [scannedUnit, setScannedUnit] = useState<UnitRow | null>(null);
   const scanInputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    const comp = invoiceCompanies.find((c) => c.id === invoiceCompanyId);
+    if (!comp) return;
+
+    // Prefill seller GST/PAN from selected company
+    setInvGstNumber(comp.gst_number ?? "");
+    setInvPanNumber(comp.pan_number ?? "");
+  }, [invoiceCompanyId, invoiceCompanies]);
 
   useEffect(() => {
     if (!scanOpen) return;
@@ -284,108 +1237,13 @@ export default function ProductUnitsPage({
     }, 50);
   };
 
-  // Print invoice (single scanned unit) — self-contained, no route dependency
-  const printSingleUnitInvoice = (u: UnitRow) => {
-    if (!product || !vendor) {
-      toast.error("Product/Vendor not ready");
-      return;
+  useEffect(() => {
+    if (statusOverrideOpen) {
+      // ✅ every time the dialog opens, clear credentials
+      setStatusOverrideEmail("");
+      setStatusOverridePassword("");
     }
-
-    const now = new Date();
-    const html = `<!doctype html>
-<html>
-<head>
-<meta charset="utf-8" />
-<title>Invoice - ${u.unit_code}</title>
-<style>
-  * { box-sizing: border-box; }
-  body { font-family: Arial, Helvetica, sans-serif; margin: 24px; color: #111; }
-  .row { display:flex; justify-content:space-between; gap: 16px; }
-  .card { border: 1px solid #e5e7eb; border-radius: 10px; padding: 14px; }
-  .title { font-size: 18px; font-weight: 700; margin: 0 0 6px; }
-  .muted { color: #6b7280; font-size: 12px; }
-  table { width:100%; border-collapse: collapse; margin-top: 10px; }
-  th, td { border: 1px solid #e5e7eb; padding: 10px; text-align:left; }
-  th { background:#f9fafb; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
-  .right { text-align:right; }
-  .big { font-size: 16px; font-weight: 700; }
-  .footer { margin-top: 16px; font-size: 12px; color:#6b7280; }
-  @media print { .no-print { display:none; } body { margin: 10mm; } }
-</style>
-</head>
-<body>
-  <div class="row">
-    <div>
-      <div class="title">Invoice</div>
-      <div class="muted">Generated: ${now.toLocaleString()}</div>
-    </div>
-    <div class="card" style="min-width: 280px;">
-      <div class="muted">Seller</div>
-      <div class="big">${vendor.display_name ?? "Vendor"}</div>
-      <div class="muted">Product: ${product.name}</div>
-      <div class="muted">Unit Code: ${u.unit_code}</div>
-    </div>
-  </div>
-
-  <div class="card" style="margin-top: 14px;">
-    <div class="muted">Customer (if SOLD)</div>
-    <div style="margin-top:6px;">
-      <b>${u.sold_customer_name ?? "-"}</b> ${
-      u.sold_customer_phone ? `(${u.sold_customer_phone})` : ""
-    }
-    </div>
-  </div>
-
-  <table>
-    <thead>
-      <tr>
-        <th>Item</th>
-        <th>Manufacture</th>
-        <th>Expiry</th>
-        <th>Status</th>
-        <th class="right">Price</th>
-      </tr>
-    </thead>
-    <tbody>
-      <tr>
-        <td>
-          <div><b>${product.name}</b></div>
-          <div class="muted">Unit: ${u.unit_code}</div>
-        </td>
-        <td>${u.manufacture_date ?? "-"}</td>
-        <td>${u.expiry_date ?? "-"}</td>
-        <td>${u.status}</td>
-        <td class="right">${u.price ?? ""}</td>
-      </tr>
-    </tbody>
-  </table>
-
-  <div class="footer">
-    This invoice is generated from the Units screen (scan flow).
-  </div>
-
-  <div class="no-print" style="margin-top:14px;">
-    <button onclick="window.print()">Print</button>
-    <button onclick="window.close()">Close</button>
-  </div>
-</body>
-</html>`;
-
-    const w = window.open(
-      "",
-      "_blank",
-      "noopener,noreferrer,width=900,height=700"
-    );
-    if (!w) {
-      toast.error("Popup blocked. Please allow popups to print.");
-      return;
-    }
-    w.document.open();
-    w.document.write(html);
-    w.document.close();
-    w.focus();
-    // user can print from the opened window
-  };
+  }, [statusOverrideOpen]);
 
   // ---------------- Auth + vendor ----------------
   useEffect(() => {
@@ -395,6 +1253,8 @@ export default function ProductUnitsPage({
       const {
         data: { session },
       } = await supabase.auth.getSession();
+
+      if (session?.user) setUserId(session.user.id);
 
       if (!session?.user) {
         setHydrated(true);
@@ -433,6 +1293,652 @@ export default function ProductUnitsPage({
       sub?.subscription?.unsubscribe();
     };
   }, [router]);
+
+  // -------- Load invoice companies --------
+  useEffect(() => {
+    if (!ready) return;
+
+    (async () => {
+      const { data, error } = await supabase
+        .from("invoice_companies")
+        .select(
+          "id,key,display_name,legal_name,address,gst_number,pan_number,phone,email,bank_name,bank_branch,account_number,ifsc_code,swift_code"
+        )
+        .order("display_name", { ascending: true });
+
+      if (error) {
+        console.warn(error);
+        return;
+      }
+      setInvoiceCompanies((data ?? []) as any);
+
+      // ✅ default select first if empty
+      if (!invoiceCompanyId && data && data.length > 0) {
+        setInvoiceCompanyId(data[0].id);
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ready]);
+
+  const invTotals = useMemo(() => {
+    let subtotal = 0;
+    let tax = 0;
+    let total = 0;
+
+    for (const it of invItems) {
+      const lineSub = Math.max(it.quantity * it.unit_price - it.discount, 0);
+      const lineTax = Math.round(lineSub * (it.tax_percent / 100) * 100) / 100;
+      const lineTotal = lineSub + lineTax;
+
+      subtotal += lineSub;
+      tax += lineTax;
+      total += lineTotal;
+    }
+
+    subtotal = Math.round(subtotal * 100) / 100;
+    tax = Math.round(tax * 100) / 100;
+    total = Math.round(total * 100) / 100;
+
+    return { subtotal, tax, total };
+  }, [invItems]);
+
+  const resetInvoiceDraft = () => {
+    setInvoiceCompanyId("");
+    setInvCustomerName("");
+    setInvBillingAddress("");
+    setInvPhone("");
+    setInvEmail("");
+    setInvContactPerson("");
+    setInvGstNumber("");
+    setInvPanNumber("");
+
+    setInvSellerGstin(""); // ✅ NEW
+    setInvoicePrintType("CUSTOMER"); // ✅ NEW
+
+    setInvInvoiceDate(todayYmd);
+    setInvDueDate("");
+    setInvNotes("");
+    setInvTaxLabel("GST");
+    setInvItems([]);
+  };
+
+  // ---------------- Invoice open helpers ----------------
+  const openInvoiceSingle = (u: UnitRow) => {
+    if (!product) return toast.error("Product not loaded");
+    if (u.status !== "SOLD")
+      return toast.error("Invoice can be generated only for SOLD units");
+
+    setInvoiceMode("SINGLE");
+    resetInvoiceDraft();
+
+    setInvCustomerName(u.sold_customer_name ?? "");
+    setInvPhone(u.sold_customer_phone ?? "");
+
+    const price = Number(u.price ?? product.sale_price ?? 0);
+    setInvItems([
+      {
+        id: crypto.randomUUID(),
+        unit_id: u.id,
+        description:
+          invoicePrintType === "ADMIN"
+            ? `${product.name} — Unit ${u.unit_code}`
+            : `${product.name}`,
+
+        hsn_sac: "",
+        quantity: 1,
+        unit_price: Number.isFinite(price) ? price : 0,
+        discount: 0,
+        tax_percent: 0,
+      },
+    ]);
+
+    setInvoiceOpen(true);
+  };
+
+  useEffect(() => {
+    const c = invoiceCompanies.find((x) => x.id === invoiceCompanyId);
+    if (!c) return;
+    // if user didn't manually set, auto-fill from company GST
+    if (!invSellerGstin) setInvSellerGstin(c.gst_number ?? "");
+  }, [invoiceCompanyId, invoiceCompanies, invSellerGstin]);
+
+  const fetchSelectedUnits = async (): Promise<UnitRow[]> => {
+    if (!vendor?.id) return [];
+    const ids = Array.from(selectedIds);
+    if (ids.length === 0) return [];
+
+    const out: UnitRow[] = [];
+    for (let i = 0; i < ids.length; i += 500) {
+      const slice = ids.slice(i, i + 500);
+
+      const { data, error } = await supabase
+        .from("inventory_units")
+        .select(
+          "id,unit_code,manufacture_date,expiry_date,status,created_at,price,sold_customer_name,sold_customer_phone,is_verified,verified_at"
+        )
+        .eq("vendor_id", vendor.id)
+        .eq("product_id", productId)
+        .in("id", slice)
+        .order("created_at", { ascending: false });
+
+      if (error) {
+        toast.error(error.message || "Failed to load selected units");
+        return [];
+      }
+
+      out.push(...((data ?? []) as any as UnitRow[]));
+    }
+
+    return out;
+  };
+
+  const openInvoiceMultiFromSelected = async () => {
+    if (!product) return toast.error("Product not loaded");
+    if (selectedIds.size === 0) return toast.error("Select units first");
+
+    const rows = await fetchSelectedUnits();
+    if (rows.length === 0) return;
+
+    const notSold = rows.filter((r) => r.status !== "SOLD");
+    if (notSold.length > 0) {
+      toast.error(
+        `Only SOLD units can be invoiced. Not SOLD: ${notSold.length}`
+      );
+      return;
+    }
+
+    setInvoiceMode("MULTI");
+    resetInvoiceDraft();
+
+    // if all have same customer, prefill
+    const firstName = rows[0].sold_customer_name ?? "";
+    const sameName = rows.every(
+      (r) => (r.sold_customer_name ?? "") === firstName
+    );
+    if (sameName) setInvCustomerName(firstName);
+
+    const firstPhone = rows[0].sold_customer_phone ?? "";
+    const samePhone = rows.every(
+      (r) => (r.sold_customer_phone ?? "") === firstPhone
+    );
+    if (samePhone) setInvPhone(firstPhone);
+
+    setInvItems(
+      rows.map((u) => {
+        const price = Number(u.price ?? product.sale_price ?? 0);
+        return {
+          id: crypto.randomUUID(),
+          unit_id: u.id,
+          description:
+            invoicePrintType === "ADMIN"
+              ? `${product.name} — Unit ${u.unit_code}`
+              : `${product.name}`,
+
+          hsn_sac: "",
+          quantity: 1,
+          unit_price: Number.isFinite(price) ? price : 0,
+          discount: 0,
+          tax_percent: 0,
+        };
+      })
+    );
+
+    setInvoiceOpen(true);
+  };
+
+  // ✅ Create PDF once (used for Print + Download)
+  const buildCurrentInvoicePdfBytes = async () => {
+    const comp = invoiceCompanies.find((c) => c.id === invoiceCompanyId);
+
+    const invoiceNumber = `INV-${Date.now()}`; // local number (no API)
+    const draft: DraftInvoiceForPdf = {
+      invoiceNumber,
+      invoiceDate: invInvoiceDate || todayYmd,
+      companyName: comp?.display_name || "Invoice Company",
+      companyGst: invGstNumber || comp?.gst_number || undefined,
+      companyPan: invPanNumber || comp?.pan_number || undefined,
+      companyAddress: comp?.address || undefined,
+      customerName: invCustomerName || "-",
+      customerPhone: invPhone || undefined,
+      customerEmail: invEmail || undefined,
+      billingAddress: invBillingAddress || undefined,
+      taxLabel: invTaxLabel || "GST",
+      notes: invNotes || undefined,
+      items: invItems.map((it) => ({
+        description: it.description,
+        hsn_sac: it.hsn_sac || null,
+        quantity: Number(it.quantity || 1),
+        unit_price: Number(it.unit_price || 0),
+        discount: Number(it.discount || 0),
+        tax_percent: Number(it.tax_percent || 0),
+      })),
+      subtotal: invTotals.subtotal,
+      tax: invTotals.tax,
+      total: invTotals.total,
+    };
+
+    return await buildInvoicePdfFromDraft(draft);
+  };
+
+  const createInvoiceNow = async () => {
+    const isAdmin = invoicePrintType === "ADMIN";
+
+    const rows = invItems.map((it, idx) => {
+      const baseDesc = (it.description || "").trim();
+
+      // CUSTOMER: remove unit part if present
+      const customerDesc = baseDesc.includes("—")
+        ? baseDesc.split("—")[0].trim()
+        : baseDesc;
+
+      const description = isAdmin ? baseDesc : customerDesc;
+
+      const qty = Math.max(1, Number(it.quantity || 1));
+      const rate = Math.max(0, Number(it.unit_price || 0));
+      const discount = Math.max(0, Number(it.discount || 0));
+      const tax_percent = Math.max(0, Number(it.tax_percent || 0));
+
+      const base = Math.max(qty * rate - discount, 0); // subtotal for this row
+      const tax = Math.round(base * (tax_percent / 100) * 100) / 100;
+      const amount = Math.round((base + tax) * 100) / 100;
+
+      return {
+        idx: idx + 1,
+        description,
+        hsn_sac: it.hsn_sac || "",
+        qty,
+        rate,
+        discount,
+        tax_percent,
+        base,
+        tax,
+        amount,
+      };
+    });
+
+    const subtotal =
+      Math.round(rows.reduce((a, r) => a + r.base, 0) * 100) / 100;
+    const taxTotal =
+      Math.round(rows.reduce((a, r) => a + r.tax, 0) * 100) / 100;
+    const grandTotal = Math.round((subtotal + taxTotal) * 100) / 100;
+
+    if (!invoiceCompanyId) return toast.error("Select invoice company");
+    if (!invCustomerName.trim())
+      return toast.error("Customer name is required");
+    if (invItems.length === 0) return toast.error("No invoice items");
+
+    if (invoiceMode === "SINGLE" && invItems.length !== 1) {
+      return toast.error("Single invoice must have exactly 1 unit");
+    }
+
+    const comp =
+      invoiceCompanies.find((c) => c.id === invoiceCompanyId) || null;
+    if (!comp) return toast.error("Invoice company not found");
+
+    setInvWorking(true);
+    try {
+      // ✅ Generate invoice no (frontend only)
+      const invoiceNo =
+        "MK" +
+        new Date().getFullYear() +
+        "-" +
+        String(Math.floor(Math.random() * 900000 + 100000));
+
+      const invoiceDate =
+        invInvoiceDate || new Date().toISOString().slice(0, 10);
+
+      // ---- helpers ----
+      const money = (n: number) => {
+        const x = Number.isFinite(n) ? n : 0;
+        return x.toFixed(2);
+      };
+
+      const safe = (s?: string | null) => String(s ?? "").trim();
+
+      const wrapText = (text: string, maxChars: number) => {
+        const t = safe(text);
+        if (!t) return [""];
+        const words = t.split(/\s+/);
+        const lines: string[] = [];
+        let cur = "";
+        for (const w of words) {
+          const next = cur ? `${cur} ${w}` : w;
+          if (next.length > maxChars) {
+            if (cur) lines.push(cur);
+            cur = w;
+          } else cur = next;
+        }
+        if (cur) lines.push(cur);
+        return lines.length ? lines : [t];
+      };
+
+      // ---- totals ----
+
+      // const rows = invItems.map((it) => {
+      //   const qty = Math.max(1, Number(it.quantity || 1));
+      //   const rate = Math.max(0, Number(it.unit_price || 0));
+      //   const disc = Math.max(0, Number(it.discount || 0));
+      //   const base = Math.max(qty * rate - disc, 0);
+      //   const tax = Math.round(base * (Number(it.tax_percent || 0) / 100) * 100) / 100;
+      //   const amount = base + tax;
+      //   subtotal += base;
+      //   taxTotal += tax;
+      //   grandTotal += amount;
+      //   return { ...it, qty, rate, disc, base, tax, amount };
+      // });
+
+      // ---- PDF ----
+      const pdfDoc = await PDFDocument.create();
+      const page = pdfDoc.addPage([595.28, 841.89]); // A4
+      const { width, height } = page.getSize();
+
+      const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+      const bold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+
+      const margin = 48;
+      let y = height - margin;
+
+      const line = (yy: number) => {
+        page.drawLine({
+          start: { x: margin, y: yy },
+          end: { x: width - margin, y: yy },
+          thickness: 1,
+        });
+      };
+
+      const text = (
+        t: string,
+        x: number,
+        yy: number,
+        size = 10,
+        isBold = false
+      ) => {
+        page.drawText(safe(t), { x, y: yy, size, font: isBold ? bold : font });
+      };
+
+      const rightText = (
+        t: string,
+        rightX: number,
+        yy: number,
+        size = 10,
+        isBold = false
+      ) => {
+        const f = isBold ? bold : font;
+        const w = f.widthOfTextAtSize(t, size);
+        page.drawText(t, { x: rightX - w, y: yy, size, font: f });
+      };
+
+      // ---- HEADER (left company, right invoice box) ----
+      text(
+        comp.display_name || comp.legal_name || "Company",
+        margin,
+        y,
+        13,
+        true
+      );
+      y -= 18;
+
+      if (
+        safe(comp.legal_name) &&
+        safe(comp.legal_name) !== safe(comp.display_name)
+      ) {
+        text(comp.legal_name || "", margin, y, 9, false);
+        y -= 14;
+      }
+
+      if (safe(comp.email)) {
+        text(`Support Email: ${safe(comp.email)}`, margin, y, 9, false);
+        y -= 14;
+      }
+
+      rightText("INVOICE", width - margin, height - margin, 12, true);
+      rightText(
+        `Invoice No: ${invoiceNo}`,
+        width - margin,
+        height - margin - 18,
+        10,
+        false
+      );
+      rightText(
+        `Invoice Date: ${invoiceDate}`,
+        width - margin,
+        height - margin - 34,
+        10,
+        false
+      );
+
+      y -= 6;
+      line(y);
+      y -= 24;
+
+      // ---- BILL TO / INVOICE INFO ----
+      const leftX = margin;
+      const rightX = width / 2 + 10;
+
+      text("Bill To", leftX, y, 10, true);
+      text("Invoice Info", rightX, y, 10, true);
+      y -= 16;
+
+      const billLines: string[] = [];
+      billLines.push(invCustomerName.trim() || "-");
+      if (safe(invBillingAddress))
+        billLines.push(...wrapText(invBillingAddress, 42));
+      if (safe(invPhone)) billLines.push(`Phone: ${safe(invPhone)}`);
+      if (safe(invGstNumber)) billLines.push(`GSTIN: ${safe(invGstNumber)}`);
+      if (safe(invPanNumber)) billLines.push(`PAN: ${safe(invPanNumber)}`);
+
+      let billY = y;
+      for (const bl of billLines) {
+        text(bl, leftX, billY, 9, false);
+        billY -= 13;
+      }
+
+      const infoLines: string[] = [];
+      if (safe(invEmail)) infoLines.push(`Customer Email: ${safe(invEmail)}`);
+      // if (safe(comp.gst_number)) infoLines.push(`Seller GSTIN: ${safe(comp.gst_number)}`);
+      if (safe(comp.pan_number))
+        infoLines.push(`Seller PAN: ${safe(comp.pan_number)}`);
+
+      let infoY = y;
+      for (const il of infoLines) {
+        text(il, rightX, infoY, 9, false);
+        infoY -= 13;
+      }
+
+      y = Math.min(billY, infoY) - 14;
+      line(y);
+      y -= 22;
+
+      // ---- TABLE HEADER (FIXED WIDTH, NO CUT-OFF) ----
+      const tableLeft = margin;
+      const tableRight = width - margin;
+      const tableW = tableRight - tableLeft;
+
+      // column widths (tuned to fit A4 usable width)
+      const W_NO = 20;
+      const W_DESC = Math.max(160, Math.floor(tableW * 0.4)); // flexible
+      const W_HSN = 60;
+      const W_QTY = 32;
+      const W_UNIT = 68;
+      const W_TAX = 44;
+
+      // Amount takes remaining width
+      const W_AMT = tableW - (W_NO + W_DESC + W_HSN + W_QTY + W_UNIT + W_TAX);
+
+      const X_NO = tableLeft;
+      const X_DESC = X_NO + W_NO;
+      const X_HSN = X_DESC + W_DESC;
+      const X_QTY = X_HSN + W_HSN;
+      const X_UNIT = X_QTY + W_QTY;
+      const X_TAX = X_UNIT + W_UNIT;
+      const X_AMT = X_TAX + W_TAX; // left of amount col
+
+      const PAD = 4;
+
+      // helper: wrap text by actual width (pdf-lib font metrics)
+      const wrapByWidth = (value: string, maxWidth: number, size = 9) => {
+        const s = String(value ?? "").trim();
+        if (!s) return [""];
+        const words = s.split(/\s+/);
+        const lines: string[] = [];
+        let cur = "";
+
+        for (const w of words) {
+          const trial = cur ? `${cur} ${w}` : w;
+          const trialW = font.widthOfTextAtSize(trial, size);
+          if (trialW <= maxWidth) {
+            cur = trial;
+          } else {
+            if (cur) lines.push(cur);
+            cur = w;
+          }
+        }
+        if (cur) lines.push(cur);
+        return lines.length ? lines : [s];
+      };
+
+      const drawRowLine = (yy: number) => {
+        page.drawLine({
+          start: { x: tableLeft, y: yy },
+          end: { x: tableRight, y: yy },
+          thickness: 1,
+        });
+      };
+
+      // header text
+      text("#", X_NO + PAD, y, 9, true);
+      text("Description", X_DESC + PAD, y, 9, true);
+      text("HSN/SAC", X_HSN + PAD, y, 9, true);
+      rightText("Qty", X_QTY + W_QTY - PAD, y, 9, true);
+      rightText("Unit Price", X_UNIT + W_UNIT - PAD, y, 9, true);
+      rightText("Tax %", X_TAX + W_TAX - PAD, y, 9, true);
+      rightText("Amount", X_AMT + W_AMT - PAD, y, 9, true);
+
+      y -= 12;
+      drawRowLine(y);
+      y -= 16;
+
+      // ---- TABLE ROWS (NO OVERFLOW) ----
+      rows.forEach((r, idx) => {
+        // wrap description within description column width
+        const descLines = wrapByWidth(r.description, W_DESC - PAD * 2, 9).slice(
+          0,
+          3
+        );
+
+        const rowTopY = y;
+
+        // No
+        text(String(idx + 1), X_NO + PAD, rowTopY, 9, false);
+
+        // Description (multi-line)
+        descLines.forEach((ln, i) => {
+          text(ln, X_DESC + PAD, rowTopY - i * 12, 9, false);
+        });
+
+        // HSN
+        text(String(r.hsn_sac || ""), X_HSN + PAD, rowTopY, 9, false);
+
+        // Qty / Unit / Tax / Amount (right aligned)
+        rightText(String(r.qty), X_QTY + W_QTY - PAD, rowTopY, 9, false);
+        rightText(money(r.rate), X_UNIT + W_UNIT - PAD, rowTopY, 9, false);
+        rightText(
+          money(Number(r.tax_percent || 0)),
+          X_TAX + W_TAX - PAD,
+          rowTopY,
+          9,
+          false
+        );
+        rightText(money(r.amount), X_AMT + W_AMT - PAD, rowTopY, 9, false);
+
+        // row height based on wrapped lines
+        const rowH = Math.max(14, descLines.length * 12);
+        y -= rowH + 10;
+      });
+
+      y -= 6;
+      drawRowLine(y);
+      y -= 18;
+
+      // ---- TOTALS ----
+      const valX = width - margin;
+
+      rightText("Subtotal", valX - 70, y, 10, false);
+      rightText(money(subtotal), valX, y, 10, false);
+      y -= 14;
+
+      rightText(invTaxLabel || "Tax", valX - 70, y, 10, false);
+      rightText(money(taxTotal), valX, y, 10, false);
+      y -= 16;
+
+      rightText("Total", valX - 70, y, 11, true);
+      rightText(money(grandTotal), valX, y, 11, true);
+
+      y -= 30;
+      line(y);
+      y -= 18;
+
+      // ---- NOTES + POLICY ----
+      text("Notes", margin, y, 10, true);
+      y -= 14;
+
+      const notesLines = wrapText(invNotes || "", 85);
+      notesLines.slice(0, 4).forEach((nl) => {
+        text(nl, margin, y, 9, false);
+        y -= 13;
+      });
+
+      y -= 10;
+
+      const disclaimer = [
+        "Reseller Disclaimer",
+        "We are resellers and are not responsible for product usage or handling guidance.",
+        "For detailed information on how to use the product safely and effectively, please contact the product manufacturer directly.",
+        "",
+        "Return Policy",
+        "• Returns are accepted within 5 days from the date of delivery.",
+        "• Returns are only accepted for products with damaged packaging or expired items.",
+        "• Used products or items with broken or tampered seals are not eligible for return.",
+      ];
+
+      disclaimer.forEach((dl, i) => {
+        if (!dl) {
+          y -= 8;
+          return;
+        }
+        text(
+          dl,
+          margin,
+          y,
+          i === 0 || dl === "Return Policy" ? 9 : 8.8,
+          i === 0 || dl === "Return Policy"
+        );
+        y -= 12.5;
+      });
+
+      const pdfBytes = await pdfDoc.save();
+
+      // ✅ Open + Download
+      const blob = new Blob([pdfBytes], { type: "application/pdf" });
+      const url = URL.createObjectURL(blob);
+
+      // open in new tab (user prints from PDF viewer)
+      window.open(url, "_blank", "noopener,noreferrer");
+
+      // auto-download too
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `Invoice_${invoiceNo}.pdf`;
+      a.click();
+
+      toast.success("Invoice PDF generated");
+    } catch (e: any) {
+      console.error(e);
+      toast.error(e?.message || "Failed to generate invoice PDF");
+    } finally {
+      setInvWorking(false);
+    }
+  };
 
   // -------- Load product + brand (once) --------
   useEffect(() => {
@@ -476,7 +1982,7 @@ export default function ProductUnitsPage({
     return () => {
       cancelled = true;
     };
-  }, [ready, vendor?.id, productId]);
+  }, [ready, vendor?.id, productId, productId]);
 
   // ---------------- Filters applied to query ----------------
   function applyUnitFilters(q: any) {
@@ -489,9 +1995,6 @@ export default function ProductUnitsPage({
       q = q.not("expiry_date", "is", null).lt("expiry_date", todayYmd);
     }
     if (expiredFilter === "NOT_EXPIRED") {
-      // includeNoExpiry affects what "not expired" means:
-      // - if includeNoExpiry=true => not expired = (expiry_date is null OR expiry_date >= today)
-      // - if includeNoExpiry=false => not expired = (expiry_date >= today)
       if (includeNoExpiry) {
         q = q.or(`expiry_date.is.null,expiry_date.gte.${todayYmd}`);
       } else {
@@ -533,6 +2036,61 @@ export default function ProductUnitsPage({
     return q;
   }
 
+  const computeBulkDeleteMeta = async (scope: "SELECTED" | "FILTERED") => {
+    if (!vendor?.id) return;
+
+    setBulkDeleteMetaLoading(true);
+    try {
+      if (scope === "SELECTED") {
+        const ids = Array.from(selectedIds);
+        if (ids.length === 0) {
+          setBulkDeleteVerifiedCount(0);
+          return;
+        }
+
+        let verified = 0;
+
+        for (let i = 0; i < ids.length; i += 500) {
+          const slice = ids.slice(i, i + 500);
+          const { data, error } = await supabase
+            .from("inventory_units")
+            .select("id,is_verified")
+            .eq("vendor_id", vendor.id)
+            .eq("product_id", productId)
+            .in("id", slice);
+
+          if (error) throw error;
+
+          for (const r of (data ?? []) as any[]) {
+            if (r.is_verified) verified += 1;
+          }
+        }
+
+        setBulkDeleteVerifiedCount(verified);
+      } else {
+        let q = supabase
+          .from("inventory_units")
+          .select("id", { count: "exact", head: true })
+          .eq("vendor_id", vendor.id)
+          .eq("product_id", productId)
+          .eq("is_verified", true);
+
+        q = applyUnitFilters(q);
+
+        const { count, error } = await q;
+        if (error) throw error;
+
+        setBulkDeleteVerifiedCount(count ?? 0);
+      }
+    } catch (e: any) {
+      console.error(e);
+      toast.error(e?.message || "Failed to analyze bulk delete set");
+      setBulkDeleteVerifiedCount(0);
+    } finally {
+      setBulkDeleteMetaLoading(false);
+    }
+  };
+
   // -------- Fetch units --------
   const fetchUnits = async () => {
     if (!vendor?.id) return;
@@ -543,7 +2101,7 @@ export default function ProductUnitsPage({
       const to = from + pageSize - 1;
 
       let q = baseUnitsQuery(
-        "id,unit_code,manufacture_date,expiry_date,status,created_at,price,sold_customer_name,sold_customer_phone",
+        "id,unit_code,manufacture_date,expiry_date,status,created_at,price,sold_customer_name,sold_customer_phone,is_verified,verified_at",
         true
       );
       if (!q) return;
@@ -635,14 +2193,64 @@ export default function ProductUnitsPage({
     return chips;
   }, [search, statusFilter, mfgFrom, mfgTo, expFrom, expTo, includeNoExpiry]);
 
+  // ---------------- Verified lock ----------------
+  const markVerified = async (u: UnitRow) => {
+    if (!vendor?.id) return;
+
+    if (u.is_verified) {
+      toast.info("Already verified.");
+      return;
+    }
+
+    const yes = confirm(
+      `Mark this unit as VERIFIED?\n\n${u.unit_code}\n\nAfter verification it cannot be edited/deleted (admin override needed).`
+    );
+    if (!yes) return;
+
+    const { error } = await supabase
+      .from("inventory_units")
+      .update({
+        is_verified: true,
+        verified_at: new Date().toISOString(),
+        verified_by: userId || null,
+      })
+      .eq("id", u.id)
+      .eq("vendor_id", vendor.id);
+
+    if (error) {
+      toast.error(error.message || "Failed to verify unit");
+      return;
+    }
+
+    toast.success("Unit verified");
+    fetchUnits();
+  };
+
   // ---------------- Single edit/delete ----------------
   const openEdit = (u: UnitRow) => {
+    if (u.is_verified) {
+      toast.error("This unit is VERIFIED. Editing is locked.");
+      return;
+    }
     setEditUnit(u);
     setEditOpen(true);
   };
 
   const deleteUnit = async (u: UnitRow) => {
     if (!vendor?.id) return;
+
+    if (u.is_verified) {
+      toast.error("This unit is VERIFIED. Normal delete is blocked.");
+      setOverrideTarget(u);
+
+      // ✅ auto-fill static creds (kept inputs)
+      setOverrideEmail("");
+      setOverridePassword("");
+
+      setOverrideDeleteOpen(true);
+      return;
+    }
+
     const yes = confirm(`Delete unit ${u.unit_code}?`);
     if (!yes) return;
 
@@ -661,13 +2269,75 @@ export default function ProductUnitsPage({
     fetchUnits();
   };
 
+  // ✅ Override delete uses static creds (no typing needed)
+  const runOverrideDelete = async () => {
+    if (!overrideTarget || !vendor?.id) return;
+
+    const username = overrideEmail.trim();
+    const password = overridePassword;
+
+    if (!username || !password) {
+      toast.error("Enter override username and password");
+      return;
+    }
+
+    // ✅ Static auth gate
+    if (!checkStaticOverride(username, password)) {
+      toast.error("Invalid override credentials");
+      return;
+    }
+
+    setOverrideWorking(true);
+    try {
+      // IMPORTANT: this uses current logged-in vendor session (no admin sign-in)
+      const { error: delErr } = await supabase
+        .from("inventory_units")
+        .delete()
+        .eq("id", overrideTarget.id)
+        .eq("vendor_id", vendor.id)
+        .eq("product_id", productId);
+
+      if (delErr) {
+        toast.error(delErr.message || "Override delete failed");
+        return;
+      }
+
+      toast.success("Deleted with override");
+      setOverrideDeleteOpen(false);
+      setOverrideTarget(null);
+      setOverrideEmail("");
+      setOverridePassword("");
+      await fetchUnits();
+    } finally {
+      setOverrideWorking(false);
+    }
+  };
+
+  useEffect(() => {
+    if (overrideDeleteOpen) {
+      // ✅ every time the dialog opens, clear credentials
+      setOverrideEmail("");
+      setOverridePassword("");
+    }
+  }, [overrideDeleteOpen]);
+
   // ---------------- Status updates (single row list) ----------------
   const updateStatusDirect = async (u: UnitRow, next: InventoryStatus) => {
     if (!vendor?.id) return;
     if (u.status === next) return;
 
-    if (next === "SOLD") {
-      openSoldDialogSingle(u);
+    // 🔒 SOLD lock: cannot change without admin
+    if (u.status === "SOLD") {
+      toast.error(
+        "This unit is SOLD. Admin override required to change status."
+      );
+      openStatusOverride(u, next);
+      return;
+    }
+
+    // 🔒 Setting SOLD / RETURNED requires admin
+    if (next === "SOLD" || next === "RETURNED") {
+      openStatusOverride(u, next);
       return;
     }
 
@@ -703,9 +2373,16 @@ export default function ProductUnitsPage({
     if (!vendor?.id || !scannedUnit) return;
     if (scannedUnit.status === next) return;
 
-    if (next === "SOLD") {
-      // use existing SOLD flow (customer dialog) without breaking features
-      openSoldDialogSingle(scannedUnit);
+    if (scannedUnit.status === "SOLD") {
+      toast.error(
+        "This unit is SOLD. Admin override required to change status."
+      );
+      openStatusOverride(scannedUnit, next);
+      return;
+    }
+
+    if (next === "SOLD" || next === "RETURNED") {
+      openStatusOverride(scannedUnit, next);
       return;
     }
 
@@ -729,7 +2406,6 @@ export default function ProductUnitsPage({
 
     toast.success(`Updated status to ${next}`);
     setScanLoading(false);
-    // keep list in sync
     await fetchUnits();
   };
 
@@ -745,7 +2421,7 @@ export default function ProductUnitsPage({
       const { data, error } = await supabase
         .from("inventory_units")
         .select(
-          "id,unit_code,manufacture_date,expiry_date,status,created_at,price,sold_customer_name,sold_customer_phone"
+          "id,unit_code,manufacture_date,expiry_date,status,created_at,price,sold_customer_name,sold_customer_phone,is_verified,verified_at"
         )
         .eq("vendor_id", vendor.id)
         .eq("product_id", productId)
@@ -767,7 +2443,6 @@ export default function ProductUnitsPage({
     } finally {
       setScanLoading(false);
       setTimeout(() => {
-        // keep cursor ready for next scan
         scanInputRef.current?.focus();
         scanInputRef.current?.select();
       }, 60);
@@ -885,6 +2560,12 @@ export default function ProductUnitsPage({
   const saveSoldWithCustomer = async () => {
     if (!vendor?.id || !soldTargetUnit) return;
 
+    // ✅ REQUIRED: admin authorization for SOLD
+    if (!soldAuthOk) {
+      toast.error("Admin authorization required to mark SOLD");
+      return;
+    }
+
     const name = custName.trim();
     const phone = custPhone.trim();
 
@@ -913,7 +2594,6 @@ export default function ProductUnitsPage({
 
       toast.success("Marked SOLD with customer details");
 
-      // keep scan panel in sync too
       if (scannedUnit?.id === soldTargetUnit.id) {
         setScannedUnit((prev) =>
           prev
@@ -930,6 +2610,7 @@ export default function ProductUnitsPage({
       setSoldDialogOpen(false);
       setSoldTargetUnit(null);
       resetSoldForm();
+      setSoldAuthOk(false);
       await fetchUnits();
     } finally {
       setUpdatingId(null);
@@ -940,29 +2621,18 @@ export default function ProductUnitsPage({
   const buildCsv = (rows: UnitRow[]) => {
     if (!product) return "";
 
-    const header = [
-      "product_name",
-      "unit_price",
-      "unit_code",
-      "status",
-      "manufacture_date",
-      "expiry_date",
-      "sold_customer_name",
-      "sold_customer_phone",
-    ];
+    const header = ["unit_code", "product_name", "mrp", "verified"];
     const lines = [header.join(",")];
+
+    const mrp = product.sale_price ?? "";
 
     for (const u of rows) {
       lines.push(
         [
-          csvEscape(product.name),
-          csvEscape(u.price ?? ""),
           csvEscape(u.unit_code),
-          csvEscape(u.status),
-          csvEscape(u.manufacture_date ?? ""),
-          csvEscape(u.expiry_date ?? ""),
-          csvEscape(u.sold_customer_name ?? ""),
-          csvEscape(u.sold_customer_phone ?? ""),
+          csvEscape(product.name),
+          csvEscape(mrp),
+          csvEscape(u.is_verified ? "YES" : "NO"),
         ].join(",")
       );
     }
@@ -1002,7 +2672,7 @@ export default function ProductUnitsPage({
         const to = from + chunk - 1;
 
         let q = baseUnitsQuery(
-          "id,unit_code,manufacture_date,expiry_date,status,created_at,price,sold_customer_name,sold_customer_phone",
+          "id,unit_code,manufacture_date,expiry_date,status,created_at,price,sold_customer_name,sold_customer_phone,is_verified,verified_at",
           false
         );
         if (!q) return;
@@ -1032,36 +2702,6 @@ export default function ProductUnitsPage({
     }
   };
 
-  const fetchSelectedUnits = async (): Promise<UnitRow[]> => {
-    if (!vendor?.id) return [];
-    const ids = Array.from(selectedIds);
-    if (ids.length === 0) return [];
-
-    const out: UnitRow[] = [];
-    for (let i = 0; i < ids.length; i += 500) {
-      const slice = ids.slice(i, i + 500);
-
-      const { data, error } = await supabase
-        .from("inventory_units")
-        .select(
-          "id,unit_code,manufacture_date,expiry_date,status,created_at,price,sold_customer_name,sold_customer_phone"
-        )
-        .eq("vendor_id", vendor.id)
-        .eq("product_id", productId)
-        .in("id", slice)
-        .order("created_at", { ascending: false });
-
-      if (error) {
-        toast.error(error.message || "Failed to load selected units");
-        return [];
-      }
-
-      out.push(...((data ?? []) as any as UnitRow[]));
-    }
-
-    return out;
-  };
-
   const exportSelected = async () => {
     if (!product) return toast.error("Product not loaded yet");
     if (selectedIds.size === 0) return toast.error("No units selected");
@@ -1084,6 +2724,274 @@ export default function ProductUnitsPage({
   const runBulkDelete = async () => {
     if (!vendor?.id) return;
 
+    if (!bulkDeleteName.trim()) {
+      toast.error("Enter your name to continue");
+      return;
+    }
+
+    if (!bulkDeleteAck) {
+      toast.error("Please acknowledge the deletion");
+      return;
+    }
+
+    const hasVerified = bulkDeleteVerifiedCount > 0;
+    const skippingVerified = hasVerified && bulkDeleteMode === "SKIP_VERIFIED";
+
+    // ✅ If skipping verified: no admin needed, delete only non-verified
+    if (skippingVerified) {
+      if (bulkDeleteConfirm.trim().toUpperCase() !== "DELETE") {
+        toast.error('Type "DELETE" to confirm');
+        return;
+      }
+
+      setBulkDeleting(true);
+      try {
+        let deletedCount = 0;
+        let totalTarget =
+          bulkDeleteScope === "SELECTED" ? selectedIds.size : totalCount;
+
+        if (bulkDeleteScope === "SELECTED") {
+          const ids = Array.from(selectedIds);
+          if (ids.length === 0) {
+            toast.error("No units selected");
+            return;
+          }
+
+          const deletableIds: string[] = [];
+          for (let i = 0; i < ids.length; i += 500) {
+            const slice = ids.slice(i, i + 500);
+            const { data, error } = await supabase
+              .from("inventory_units")
+              .select("id,is_verified")
+              .eq("vendor_id", vendor.id)
+              .eq("product_id", productId)
+              .in("id", slice);
+
+            if (error) {
+              toast.error(error.message || "Failed to check verified units");
+              return;
+            }
+
+            for (const r of (data ?? []) as any[]) {
+              if (!r.is_verified) deletableIds.push(r.id);
+            }
+          }
+
+          if (deletableIds.length === 0) {
+            toast.info("All selected units are verified. Nothing deleted.");
+          } else {
+            for (let i = 0; i < deletableIds.length; i += 500) {
+              const slice = deletableIds.slice(i, i + 500);
+              const { error } = await supabase
+                .from("inventory_units")
+                .delete()
+                .eq("vendor_id", vendor.id)
+                .eq("product_id", productId)
+                .in("id", slice)
+                .eq("is_verified", false);
+
+              if (error) {
+                toast.error(error.message || "Bulk delete failed");
+                return;
+              }
+              deletedCount += slice.length;
+            }
+          }
+
+          setSelectedIds(new Set());
+        } else {
+          let q = supabase
+            .from("inventory_units")
+            .delete()
+            .eq("vendor_id", vendor.id)
+            .eq("product_id", productId)
+            .eq("is_verified", false);
+
+          q = applyUnitFilters(q);
+
+          const { error } = await q;
+          if (error) {
+            toast.error(error.message || "Bulk delete failed");
+            return;
+          }
+
+          deletedCount = Math.max(0, totalTarget - bulkDeleteVerifiedCount);
+          setSelectedIds(new Set());
+        }
+
+        await supabase.from("inventory_units_bulk_delete_audit").insert([
+          {
+            vendor_id: vendor.id,
+            product_id: productId,
+            scope: bulkDeleteScope,
+            total_units: totalTarget,
+            verified_units: bulkDeleteVerifiedCount,
+            deleted_units: deletedCount,
+            skipped_verified_units: bulkDeleteVerifiedCount,
+            deleted_by_name: bulkDeleteName.trim(),
+            deleted_by_email: null,
+            deleted_by_user_id: userId || null,
+            is_admin_override: false,
+            filters:
+              bulkDeleteScope === "FILTERED"
+                ? {
+                    search,
+                    statusFilter,
+                    mfgFrom,
+                    mfgTo,
+                    expFrom,
+                    expTo,
+                    includeNoExpiry,
+                    expiredFilter,
+                  }
+                : null,
+            selected_ids:
+              bulkDeleteScope === "SELECTED" ? Array.from(selectedIds) : null,
+          },
+        ]);
+
+        toast.success(
+          `Deleted ${deletedCount} units (skipped verified: ${bulkDeleteVerifiedCount})`
+        );
+
+        setBulkDeleteOpen(false);
+        setBulkDeleteConfirm("");
+        setBulkDeleteAck(false);
+        setBulkDeleteName("");
+        setBulkDeleteAdminEmail("");
+        setBulkDeleteAdminPassword("");
+        setBulkDeleteMode("DELETE_ALL");
+
+        setPage(1);
+        await fetchUnits();
+      } finally {
+        setBulkDeleting(false);
+      }
+
+      return;
+    }
+
+    // ✅ If verified units exist AND mode is DELETE_ALL => require admin (STATIC)
+    if (hasVerified) {
+      const username = bulkDeleteAdminEmail.trim();
+      const password = bulkDeleteAdminPassword;
+
+      if (!username || !password) {
+        toast.error(
+          "Override username and password required (verified units included)"
+        );
+        return;
+      }
+
+      if (!checkStaticOverride(username, password)) {
+        toast.error("Invalid override credentials");
+        return;
+      }
+
+      setBulkDeleting(true);
+      try {
+        let deletedCount = 0;
+        let totalTarget =
+          bulkDeleteScope === "SELECTED" ? selectedIds.size : totalCount;
+
+        if (bulkDeleteScope === "SELECTED") {
+          const ids = Array.from(selectedIds);
+          if (ids.length === 0) {
+            toast.error("No units selected");
+            return;
+          }
+
+          for (let i = 0; i < ids.length; i += 500) {
+            const slice = ids.slice(i, i + 500);
+            const { error } = await supabase
+              .from("inventory_units")
+              .delete()
+              .eq("vendor_id", vendor.id)
+              .eq("product_id", productId)
+              .in("id", slice);
+
+            if (error) {
+              toast.error(error.message || "Bulk delete failed");
+              return;
+            }
+            deletedCount += slice.length;
+          }
+
+          setSelectedIds(new Set());
+        } else {
+          let q = supabase
+            .from("inventory_units")
+            .delete()
+            .eq("vendor_id", vendor.id)
+            .eq("product_id", productId);
+
+          q = applyUnitFilters(q);
+
+          const { error } = await q;
+          if (error) {
+            toast.error(error.message || "Bulk delete failed");
+            return;
+          }
+
+          deletedCount = totalTarget;
+          setSelectedIds(new Set());
+        }
+
+        await supabase.from("inventory_units_bulk_delete_audit").insert([
+          {
+            vendor_id: vendor.id,
+            product_id: productId,
+            scope: bulkDeleteScope,
+            total_units: totalTarget,
+            verified_units: bulkDeleteVerifiedCount,
+            deleted_units: deletedCount,
+            skipped_verified_units: 0,
+            deleted_by_name: bulkDeleteName.trim(),
+            deleted_by_email: null, // no admin email now
+            deleted_by_user_id: userId || null,
+            is_admin_override: true, // still mark override used
+            filters:
+              bulkDeleteScope === "FILTERED"
+                ? {
+                    search,
+                    statusFilter,
+                    mfgFrom,
+                    mfgTo,
+                    expFrom,
+                    expTo,
+                    includeNoExpiry,
+                    expiredFilter,
+                  }
+                : null,
+            selected_ids:
+              bulkDeleteScope === "SELECTED" ? Array.from(selectedIds) : null,
+          },
+        ]);
+
+        toast.success(
+          `Deleted ${deletedCount} units (override used, verified included: ${bulkDeleteVerifiedCount})`
+        );
+
+        // Clear fields so next time they must re-enter
+        setBulkDeleteAdminEmail("");
+        setBulkDeleteAdminPassword("");
+
+        setBulkDeleteOpen(false);
+        setBulkDeleteConfirm("");
+        setBulkDeleteAck(false);
+        setBulkDeleteName("");
+        setBulkDeleteMode("DELETE_ALL");
+
+        setPage(1);
+        await fetchUnits();
+      } finally {
+        setBulkDeleting(false);
+      }
+
+      return;
+    }
+
+    // No verified units => normal delete confirmation typing DELETE
     if (bulkDeleteConfirm.trim().toUpperCase() !== "DELETE") {
       toast.error('Type "DELETE" to confirm');
       return;
@@ -1091,6 +2999,10 @@ export default function ProductUnitsPage({
 
     setBulkDeleting(true);
     try {
+      let totalTarget =
+        bulkDeleteScope === "SELECTED" ? selectedIds.size : totalCount;
+      let deletedCount = 0;
+
       if (bulkDeleteScope === "SELECTED") {
         const ids = Array.from(selectedIds);
         if (ids.length === 0) {
@@ -1111,6 +3023,7 @@ export default function ProductUnitsPage({
             toast.error(error.message || "Bulk delete failed");
             return;
           }
+          deletedCount += slice.length;
         }
 
         toast.success(`Deleted ${ids.length} selected units`);
@@ -1130,12 +3043,48 @@ export default function ProductUnitsPage({
           return;
         }
 
+        deletedCount = totalTarget;
         toast.success("Deleted filtered units");
         setSelectedIds(new Set());
       }
 
+      await supabase.from("inventory_units_bulk_delete_audit").insert([
+        {
+          vendor_id: vendor.id,
+          product_id: productId,
+          scope: bulkDeleteScope,
+          total_units: totalTarget,
+          verified_units: 0,
+          deleted_units: deletedCount,
+          skipped_verified_units: 0,
+          deleted_by_name: bulkDeleteName.trim(),
+          deleted_by_email: null,
+          deleted_by_user_id: userId || null,
+          is_admin_override: false,
+          filters:
+            bulkDeleteScope === "FILTERED"
+              ? {
+                  search,
+                  statusFilter,
+                  mfgFrom,
+                  mfgTo,
+                  expFrom,
+                  expTo,
+                  includeNoExpiry,
+                  expiredFilter,
+                }
+              : null,
+          selected_ids:
+            bulkDeleteScope === "SELECTED" ? Array.from(selectedIds) : null,
+        },
+      ]);
+
       setBulkDeleteOpen(false);
       setBulkDeleteConfirm("");
+      setBulkDeleteAck(false);
+      setBulkDeleteName("");
+      setBulkDeleteMode("DELETE_ALL");
+
       setPage(1);
       await fetchUnits();
     } finally {
@@ -1143,7 +3092,7 @@ export default function ProductUnitsPage({
     }
   };
 
-  // ---------------- Bulk edit handler (status + price) ----------------
+  // ---------------- Bulk edit handler (status + dates) ----------------
   const runBulkEdit = async () => {
     if (!vendor?.id) return;
 
@@ -1159,17 +3108,8 @@ export default function ProductUnitsPage({
       patch.status = bulkNewStatus;
     }
 
-    // Manufacture date
-    if (bulkNewMfgDate.trim() !== "") {
-      patch.manufacture_date = bulkNewMfgDate;
-    }
-
-    // Expiry date
-    // - empty => no change (because user didn’t set it)
-    // - if you want to allow "set expiry to NULL", you can add a checkbox later.
-    if (bulkNewExpDate.trim() !== "") {
-      patch.expiry_date = bulkNewExpDate;
-    }
+    if (bulkNewMfgDate.trim() !== "") patch.manufacture_date = bulkNewMfgDate;
+    if (bulkNewExpDate.trim() !== "") patch.expiry_date = bulkNewExpDate;
 
     if (Object.keys(patch).length === 0) {
       toast.error("Nothing to update");
@@ -1254,6 +3194,8 @@ export default function ProductUnitsPage({
 
   return (
     <div className="space-y-4">
+      <ToastContainer position="top-right" autoClose={2500} />
+
       <Card>
         <CardHeader className="flex flex-row items-start justify-between gap-3">
           <div className="space-y-1">
@@ -1276,10 +3218,10 @@ export default function ProductUnitsPage({
             <Button variant="outline" onClick={() => router.back()}>
               Back
             </Button>
+
             <Button
               variant="outline"
               onClick={() => {
-                // clear filters
                 setSearch("");
                 setStatusFilter("ALL");
                 setMfgFrom("");
@@ -1287,14 +3229,9 @@ export default function ProductUnitsPage({
                 setExpFrom("");
                 setExpTo("");
                 setIncludeNoExpiry(true);
-
-                // clear selection + reset pagination
                 setSelectedIds(new Set());
                 setPage(1);
-
-                // force refetch (also ensures list matches cleared filters)
                 setFiltersVersion((x) => x + 1);
-
                 toast.success("Refreshed");
               }}
               disabled={!ready}
@@ -1302,13 +3239,22 @@ export default function ProductUnitsPage({
             >
               Refresh
             </Button>
-            {/* ✅ NEW: Scan Unit */}
+
+            <Button
+              variant="outline"
+              onClick={openInvoiceMultiFromSelected}
+              disabled={selectedIds.size === 0 || !product}
+              title="Create one invoice with multiple selected SOLD units"
+            >
+              Create Invoice (Selected){" "}
+              {selectedIds.size > 0 ? `(${selectedIds.size})` : ""}
+            </Button>
+
             <Button
               variant="outline"
               onClick={() => {
                 setScanOpen(true);
                 setScannedUnit(null);
-                // keep existing value so continuous scanning works
                 setTimeout(() => {
                   scanInputRef.current?.focus();
                   scanInputRef.current?.select();
@@ -1341,36 +3287,23 @@ export default function ProductUnitsPage({
             <Button onClick={() => setCreateOpen(true)}>Add units</Button>
 
             <Button
-              variant="outline"
-              onClick={() => {
-                setBulkEditScope(
-                  selectedIds.size > 0 ? "SELECTED" : "FILTERED"
-                );
-                setBulkNewStatus("NO_CHANGE");
-                setBulkNewPrice("");
-                setBulkEditOpen(true);
-              }}
-              disabled={totalCount === 0}
-              title="Bulk edit status/price"
-            >
-              Bulk Edit
-              {selectedIds.size > 0 ? ` (${selectedIds.size})` : ""}
-            </Button>
-
-            <Button
               variant="destructive"
               onClick={() => {
-                setBulkDeleteScope(
-                  selectedIds.size > 0 ? "SELECTED" : "FILTERED"
-                );
+                const scope = selectedIds.size > 0 ? "SELECTED" : "FILTERED";
+                setBulkDeleteScope(scope);
                 setBulkDeleteConfirm("");
+                setBulkDeleteAck(false);
+                setBulkDeleteName("");
+                setBulkDeleteAdminEmail("");
+                setBulkDeleteAdminPassword("");
+                setBulkDeleteMode("DELETE_ALL");
                 setBulkDeleteOpen(true);
+                computeBulkDeleteMeta(scope);
               }}
               disabled={totalCount === 0}
               title="Bulk delete"
             >
-              Bulk Delete
-              {selectedIds.size > 0 ? ` (${selectedIds.size})` : ""}
+              Bulk Delete {selectedIds.size > 0 ? ` (${selectedIds.size})` : ""}
             </Button>
           </div>
         </CardHeader>
@@ -1398,9 +3331,6 @@ export default function ProductUnitsPage({
               In stock: <b>{countsThisPage.IN_STOCK}</b>
             </div>
             <div>
-              Invoiced: <b>{countsThisPage.INVOICED}</b>
-            </div>
-            <div>
               Demo: <b>{countsThisPage.DEMO}</b>
             </div>
             <div>
@@ -1409,9 +3339,47 @@ export default function ProductUnitsPage({
             <div>
               Returned: <b>{countsThisPage.RETURNED}</b>
             </div>
-            {/* <div>
-              Out: <b>{countsThisPage.OUT_OF_STOCK}</b>
-            </div> */}
+          </div>
+
+          {/* Search bar */}
+          <div className="flex flex-col sm:flex-row gap-2 items-start sm:items-center pt-2">
+            <div className="text-xs text-muted-foreground">
+              Search unit code
+            </div>
+            <div className="flex gap-2 w-full sm:max-w-[520px]">
+              <Input
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    setPage(1);
+                    setFiltersVersion((x) => x + 1);
+                  }
+                }}
+                placeholder="Type unit code and press Enter…"
+              />
+              <Button
+                variant="outline"
+                onClick={() => {
+                  setPage(1);
+                  setFiltersVersion((x) => x + 1);
+                }}
+                disabled={!ready}
+              >
+                Search
+              </Button>
+              <Button
+                variant="outline"
+                onClick={() => {
+                  setSearch("");
+                  setPage(1);
+                  setFiltersVersion((x) => x + 1);
+                }}
+                disabled={!ready}
+              >
+                Clear
+              </Button>
+            </div>
           </div>
         </CardContent>
       </Card>
@@ -1445,8 +3413,8 @@ export default function ProductUnitsPage({
               </Select>
             </div>
           </div>
+
           <div className="flex items-center gap-3 ml-auto">
-            {/* Expired filter */}
             <Select
               value={expiredFilter}
               onValueChange={(v) => {
@@ -1465,7 +3433,6 @@ export default function ProductUnitsPage({
               </SelectContent>
             </Select>
 
-            {/* Sort */}
             <Select
               value={sortBy}
               onValueChange={(v) => {
@@ -1488,7 +3455,6 @@ export default function ProductUnitsPage({
               </SelectContent>
             </Select>
 
-            {/* Optional small badge */}
             {expiredCountThisPage > 0 ? (
               <span className="text-xs px-2 py-1 rounded-md border bg-muted">
                 Expired: <b>{expiredCountThisPage}</b>
@@ -1550,7 +3516,15 @@ export default function ProductUnitsPage({
 
                         <TableCell className="font-mono">
                           {u.unit_code}
+                          <div className="flex items-center gap-2">
+                            {u.is_verified ? (
+                              <span className="text-xs px-2 py-0.5 rounded-full border bg-muted">
+                                VERIFIED
+                              </span>
+                            ) : null}
+                          </div>
                         </TableCell>
+
                         <TableCell>{u.manufacture_date ?? "-"}</TableCell>
                         <TableCell>{u.expiry_date ?? "-"}</TableCell>
 
@@ -1591,43 +3565,16 @@ export default function ProductUnitsPage({
                                 <SelectItem value="IN_STOCK">
                                   IN_STOCK
                                 </SelectItem>
-                                <SelectItem value="INVOICED">
+                                {/* <SelectItem value="INVOICED">
                                   INVOICED
-                                </SelectItem>
+                                </SelectItem> */}
                                 <SelectItem value="DEMO">DEMO</SelectItem>
                                 <SelectItem value="SOLD">SOLD</SelectItem>
                                 <SelectItem value="RETURNED">
                                   RETURNED
                                 </SelectItem>
-                                {/* <SelectItem value="OUT_OF_STOCK">
-                                  OUT_OF_STOCK
-                                </SelectItem> */}
                               </SelectContent>
                             </Select>
-
-                            {u.status !== "SOLD" ? (
-                              <Button
-                                variant="outline"
-                                size="sm"
-                                className="h-8"
-                                disabled={updatingId === u.id}
-                                onClick={() => openSoldDialogSingle(u)}
-                              >
-                                Mark Sold
-                              </Button>
-                            ) : (
-                              <Button
-                                variant="outline"
-                                size="sm"
-                                className="h-8"
-                                disabled={updatingId === u.id}
-                                onClick={() =>
-                                  updateStatusDirect(u, "RETURNED")
-                                }
-                              >
-                                Mark Returned
-                              </Button>
-                            )}
 
                             {updatingId === u.id ? (
                               <span className="text-xs text-muted-foreground">
@@ -1639,13 +3586,30 @@ export default function ProductUnitsPage({
 
                         <TableCell className="text-right">
                           <div className="flex justify-end gap-2">
+                            {!u.is_verified ? (
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                onClick={() => markVerified(u)}
+                              >
+                                Verify
+                              </Button>
+                            ) : null}
+
                             <Button
                               variant="outline"
                               size="sm"
-                              onClick={() => openEdit(u)}
+                              onClick={() => openInvoiceSingle(u)}
+                              disabled={u.status !== "SOLD"}
+                              title={
+                                u.status !== "SOLD"
+                                  ? "Only SOLD units can be invoiced"
+                                  : "Create invoice for this unit"
+                              }
                             >
-                              Edit
+                              Invoice
                             </Button>
+
                             <Button
                               variant="destructive"
                               size="sm"
@@ -1717,10 +3681,7 @@ export default function ProductUnitsPage({
         open={scanOpen}
         onOpenChange={(v) => {
           setScanOpen(v);
-          if (!v) {
-            // don’t wipe everything (so scanner flow is smooth), but clear scanned card
-            setScannedUnit(null);
-          }
+          if (!v) setScannedUnit(null);
         }}
       >
         <DialogContent className="sm:max-w-[720px]">
@@ -1784,7 +3745,6 @@ export default function ProductUnitsPage({
               </div>
             </div>
 
-            {/* Scanned unit details */}
             {scannedUnit ? (
               <div className="rounded-md border p-3 space-y-3">
                 <div className="flex items-start justify-between gap-3">
@@ -1803,28 +3763,22 @@ export default function ProductUnitsPage({
                   <div className="flex flex-wrap gap-2 justify-end">
                     <Button
                       variant="outline"
-                      onClick={() => {
-                        // open existing edit dialog, keep everything unchanged
-                        setEditUnit(scannedUnit);
-                        setEditOpen(true);
-                      }}
+                      onClick={() => openInvoiceSingle(scannedUnit)}
+                      disabled={
+                        !product || !vendor || scannedUnit.status !== "SOLD"
+                      }
+                      title={
+                        scannedUnit.status !== "SOLD"
+                          ? "Mark SOLD first"
+                          : "Create invoice for this unit"
+                      }
                     >
-                      Edit Unit
-                    </Button>
-
-                    <Button
-                      variant="outline"
-                      onClick={() => printSingleUnitInvoice(scannedUnit)}
-                      disabled={!product || !vendor}
-                      title="Print invoice for this unit"
-                    >
-                      Print Invoice
+                      Create Invoice
                     </Button>
 
                     <Button
                       variant="outline"
                       onClick={() => {
-                        // optional: show it in list using existing filters
                         setSearch(scannedUnit.unit_code);
                         setPage(1);
                         setFiltersVersion((x) => x + 1);
@@ -1862,38 +3816,12 @@ export default function ProductUnitsPage({
                       </SelectTrigger>
                       <SelectContent className="bg-background">
                         <SelectItem value="IN_STOCK">IN_STOCK</SelectItem>
-                        <SelectItem value="INVOICED">INVOICED</SelectItem>
                         <SelectItem value="DEMO">DEMO</SelectItem>
                         <SelectItem value="SOLD">SOLD</SelectItem>
                         <SelectItem value="RETURNED">RETURNED</SelectItem>
-                        {/* <SelectItem value="OUT_OF_STOCK">
-                          OUT_OF_STOCK
-                        </SelectItem> */}
                       </SelectContent>
                     </Select>
                   </div>
-
-                  {scannedUnit.status !== "SOLD" ? (
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      className="h-9"
-                      disabled={scanLoading}
-                      onClick={() => openSoldDialogSingle(scannedUnit)}
-                    >
-                      Mark Sold
-                    </Button>
-                  ) : (
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      className="h-9"
-                      disabled={scanLoading}
-                      onClick={() => updateScannedStatus("RETURNED")}
-                    >
-                      Mark Returned
-                    </Button>
-                  )}
 
                   {scannedUnit.status === "SOLD" &&
                   (scannedUnit.sold_customer_name ||
@@ -1923,6 +3851,391 @@ export default function ProductUnitsPage({
         </DialogContent>
       </Dialog>
 
+      {/* ✅ Invoice Modal (scrollable + PDF print/download fixed) */}
+      <Dialog
+        open={invoiceOpen}
+        onOpenChange={(v) => {
+          setInvoiceOpen(v);
+          if (!v) resetInvoiceDraft();
+        }}
+      >
+        <DialogContent className="sm:max-w-[900px] max-h-[90vh] overflow-y-auto p-6">
+          <DialogHeader>
+            <DialogTitle>
+              {invoiceMode === "SINGLE"
+                ? "Create Invoice (Single Unit)"
+                : "Create Invoice (Multiple Units)"}
+            </DialogTitle>
+            <DialogDescription>
+              {invoiceMode === "SINGLE"
+                ? "Single invoice is restricted to exactly one unit."
+                : "Multi invoice: you can edit lines before creating."}
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-4">
+            {/* Top: Company + Date + Type */}
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+              <div className="space-y-1">
+                <div className="text-xs text-muted-foreground">
+                  Invoice Company *
+                </div>
+                <Select
+                  value={invoiceCompanyId}
+                  onValueChange={setInvoiceCompanyId}
+                >
+                  <SelectTrigger className="w-full">
+                    <SelectValue placeholder="Select company..." />
+                  </SelectTrigger>
+                  <SelectContent className="bg-background">
+                    {invoiceCompanies.map((c) => (
+                      <SelectItem key={c.id} value={c.id}>
+                        {c.display_name} ({c.key})
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+
+              <div className="space-y-1">
+                <div className="text-xs text-muted-foreground">
+                  Invoice Date
+                </div>
+                <Input
+                  type="date"
+                  value={invInvoiceDate}
+                  onChange={(e) => setInvInvoiceDate(e.target.value)}
+                />
+              </div>
+
+              <div className="space-y-1">
+                <div className="text-xs text-muted-foreground">
+                  Invoice Type
+                </div>
+                <Select
+                  value={invoicePrintType}
+                  onValueChange={(v) => setInvoicePrintType(v as any)}
+                >
+                  <SelectTrigger className="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent className="bg-background">
+                    <SelectItem value="CUSTOMER">
+                      Customer Invoice (No Unit Code)
+                    </SelectItem>
+                    <SelectItem value="ADMIN">
+                      Admin Invoice (Include Unit Code)
+                    </SelectItem>
+                  </SelectContent>
+                </Select>
+
+                <div className="text-[11px] text-muted-foreground">
+                  CUSTOMER: product name only • ADMIN: includes unit code in
+                  description
+                </div>
+              </div>
+            </div>
+
+            {/* Seller GST/PAN */}
+            <div className="rounded-md border p-3 space-y-3">
+              <div className="text-sm font-medium">Seller Details</div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <div className="space-y-1">
+                  <div className="text-xs text-muted-foreground">
+                    Seller GSTIN
+                  </div>
+                  <Input
+                    value={invSellerGstin}
+                    onChange={(e) => setInvSellerGstin(e.target.value)}
+                    placeholder="Auto-filled from company (editable)"
+                  />
+                </div>
+                <div className="space-y-1">
+                  <div className="text-xs text-muted-foreground">
+                    Seller PAN
+                  </div>
+                  <Input
+                    value={invSellerPan}
+                    onChange={(e) => setInvSellerPan(e.target.value)}
+                    placeholder="Auto-filled from company (editable)"
+                  />
+                </div>
+              </div>
+            </div>
+
+            {/* Customer */}
+            <div className="rounded-md border p-3 space-y-3">
+              <div className="text-sm font-medium">Bill To</div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <div className="space-y-1">
+                  <div className="text-xs text-muted-foreground">
+                    Customer Name *
+                  </div>
+                  <Input
+                    value={invCustomerName}
+                    onChange={(e) => setInvCustomerName(e.target.value)}
+                  />
+                </div>
+
+                <div className="space-y-1">
+                  <div className="text-xs text-muted-foreground">Phone</div>
+                  <Input
+                    value={invPhone}
+                    onChange={(e) => setInvPhone(e.target.value)}
+                  />
+                </div>
+
+                <div className="space-y-1 md:col-span-2">
+                  <div className="text-xs text-muted-foreground">
+                    Billing Address
+                  </div>
+                  <Input
+                    value={invBillingAddress}
+                    onChange={(e) => setInvBillingAddress(e.target.value)}
+                  />
+                </div>
+
+                <div className="space-y-1">
+                  <div className="text-xs text-muted-foreground">Email</div>
+                  <Input
+                    value={invEmail}
+                    onChange={(e) => setInvEmail(e.target.value)}
+                  />
+                </div>
+
+                <div className="space-y-1">
+                  <div className="text-xs text-muted-foreground">
+                    Customer GSTIN
+                  </div>
+                  <Input
+                    value={invGstNumber}
+                    onChange={(e) => setInvGstNumber(e.target.value)}
+                    placeholder="Optional"
+                  />
+                </div>
+
+                <div className="space-y-1">
+                  <div className="text-xs text-muted-foreground">
+                    Customer PAN
+                  </div>
+                  <Input
+                    value={invPanNumber}
+                    onChange={(e) => setInvPanNumber(e.target.value)}
+                    placeholder="Optional"
+                  />
+                </div>
+              </div>
+            </div>
+
+            {/* Items */}
+            <div className="rounded-md border p-3 space-y-3">
+              <div className="flex items-center justify-between gap-2">
+                <div className="text-sm font-medium">Invoice Items</div>
+                {invoiceMode === "SINGLE" ? (
+                  <div className="text-xs text-muted-foreground">
+                    Single mode: 1 line only
+                  </div>
+                ) : (
+                  <div className="text-xs text-muted-foreground">
+                    Multi mode: edit lines
+                  </div>
+                )}
+              </div>
+
+              <div className="overflow-x-auto">
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Description</TableHead>
+                      <TableHead className="w-[120px]">HSN</TableHead>
+                      <TableHead className="w-[90px] text-right">Qty</TableHead>
+                      <TableHead className="w-[130px] text-right">
+                        Unit
+                      </TableHead>
+                      <TableHead className="w-[120px] text-right">
+                        Discount
+                      </TableHead>
+                      <TableHead className="w-[90px] text-right">
+                        Tax%
+                      </TableHead>
+                      <TableHead className="w-[90px] text-right">
+                        Remove
+                      </TableHead>
+                    </TableRow>
+                  </TableHeader>
+
+                  <TableBody>
+                    {invItems.map((it) => (
+                      <TableRow key={it.id}>
+                        <TableCell>
+                          <Input
+                            value={it.description}
+                            onChange={(e) =>
+                              setInvItems((prev) =>
+                                prev.map((x) =>
+                                  x.id === it.id
+                                    ? { ...x, description: e.target.value }
+                                    : x
+                                )
+                              )
+                            }
+                          />
+                          <div className="text-[11px] text-muted-foreground mt-1">
+                            PDF description will follow Invoice Type:{" "}
+                            <b>
+                              {invoicePrintType === "ADMIN"
+                                ? "includes unit code"
+                                : "product only"}
+                            </b>
+                          </div>
+                        </TableCell>
+
+                        <TableCell>
+                          <Input
+                            value={it.hsn_sac}
+                            onChange={(e) =>
+                              setInvItems((prev) =>
+                                prev.map((x) =>
+                                  x.id === it.id
+                                    ? { ...x, hsn_sac: e.target.value }
+                                    : x
+                                )
+                              )
+                            }
+                          />
+                        </TableCell>
+
+                        <TableCell className="text-right">
+                          <Input type="number" value={it.quantity} disabled />
+                        </TableCell>
+
+                        <TableCell className="text-right">
+                          <Input
+                            type="number"
+                            value={it.unit_price}
+                            onChange={(e) =>
+                              setInvItems((prev) =>
+                                prev.map((x) =>
+                                  x.id === it.id
+                                    ? {
+                                        ...x,
+                                        unit_price: Number(e.target.value || 0),
+                                      }
+                                    : x
+                                )
+                              )
+                            }
+                          />
+                        </TableCell>
+
+                        <TableCell className="text-right">
+                          <Input
+                            type="number"
+                            value={it.discount}
+                            onChange={(e) =>
+                              setInvItems((prev) =>
+                                prev.map((x) =>
+                                  x.id === it.id
+                                    ? {
+                                        ...x,
+                                        discount: Number(e.target.value || 0),
+                                      }
+                                    : x
+                                )
+                              )
+                            }
+                          />
+                        </TableCell>
+
+                        <TableCell className="text-right">
+                          <Input
+                            type="number"
+                            value={it.tax_percent}
+                            onChange={(e) =>
+                              setInvItems((prev) =>
+                                prev.map((x) =>
+                                  x.id === it.id
+                                    ? {
+                                        ...x,
+                                        tax_percent: Number(
+                                          e.target.value || 0
+                                        ),
+                                      }
+                                    : x
+                                )
+                              )
+                            }
+                          />
+                        </TableCell>
+
+                        <TableCell className="text-right">
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            disabled={invoiceMode === "SINGLE"}
+                            onClick={() =>
+                              setInvItems((prev) =>
+                                prev.filter((x) => x.id !== it.id)
+                              )
+                            }
+                          >
+                            Remove
+                          </Button>
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </div>
+
+              <div className="flex items-center justify-end gap-6 text-sm">
+                <div>
+                  Subtotal: <b>{invTotals.subtotal}</b>
+                </div>
+                <div>
+                  Tax: <b>{invTotals.tax}</b>
+                </div>
+                <div>
+                  Total: <b>{invTotals.total}</b>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <div className="space-y-1">
+                  <div className="text-xs text-muted-foreground">Tax Label</div>
+                  <Input
+                    value={invTaxLabel}
+                    onChange={(e) => setInvTaxLabel(e.target.value)}
+                    placeholder="GST"
+                  />
+                </div>
+                <div className="space-y-1">
+                  <div className="text-xs text-muted-foreground">Notes</div>
+                  <Input
+                    value={invNotes}
+                    onChange={(e) => setInvNotes(e.target.value)}
+                  />
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <DialogFooter className="gap-2">
+            <Button
+              variant="outline"
+              onClick={() => setInvoiceOpen(false)}
+              disabled={invWorking}
+            >
+              Cancel
+            </Button>
+            <Button onClick={createInvoiceNow} disabled={invWorking}>
+              {invWorking ? "Generating…" : "Create PDF & Print"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       {/* ✅ Filters Modal */}
       <Dialog open={filtersOpen} onOpenChange={setFiltersOpen}>
         <DialogContent className="sm:max-w-[620px]">
@@ -1936,17 +4249,6 @@ export default function ProductUnitsPage({
           <div className="space-y-4">
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
               <div className="space-y-1">
-                <div className="text-xs text-muted-foreground">
-                  Search unit code
-                </div>
-                <Input
-                  value={search}
-                  onChange={(e) => setSearch(e.target.value)}
-                  placeholder="Eg: ABC-001"
-                />
-              </div>
-
-              <div className="space-y-1">
                 <div className="text-xs text-muted-foreground">Status</div>
                 <Select
                   value={statusFilter}
@@ -1958,11 +4260,9 @@ export default function ProductUnitsPage({
                   <SelectContent className="bg-background">
                     <SelectItem value="ALL">All</SelectItem>
                     <SelectItem value="IN_STOCK">IN_STOCK</SelectItem>
-                    <SelectItem value="INVOICED">INVOICED</SelectItem>
                     <SelectItem value="DEMO">DEMO</SelectItem>
                     <SelectItem value="SOLD">SOLD</SelectItem>
                     <SelectItem value="RETURNED">RETURNED</SelectItem>
-                    {/* <SelectItem value="OUT_OF_STOCK">OUT_OF_STOCK</SelectItem> */}
                   </SelectContent>
                 </Select>
               </div>
@@ -1991,18 +4291,7 @@ export default function ProductUnitsPage({
             </div>
 
             <div className="rounded-md border p-3 space-y-3">
-              <div className="flex items-center justify-between gap-2">
-                <div className="text-sm font-medium">Expiry Date Range</div>
-                <label className="flex items-center gap-2 text-sm">
-                  <input
-                    type="checkbox"
-                    checked={includeNoExpiry}
-                    onChange={(e) => setIncludeNoExpiry(e.target.checked)}
-                  />
-                  Include no-expiry
-                </label>
-              </div>
-
+              <div className="text-sm font-medium">Expiry Date Range</div>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div className="space-y-1">
                   <div className="text-xs text-muted-foreground">EXP From</div>
@@ -2021,6 +4310,11 @@ export default function ProductUnitsPage({
                   />
                 </div>
               </div>
+
+              <div className="text-xs text-muted-foreground">
+                Note: “Include no-expiry” is currently fixed as{" "}
+                <b>{includeNoExpiry ? "ON" : "OFF"}</b>.
+              </div>
             </div>
           </div>
 
@@ -2032,6 +4326,200 @@ export default function ProductUnitsPage({
               Clear all
             </Button>
             <Button onClick={applyFilters}>Apply</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Admin Override Delete (single unit) */}
+      <Dialog open={overrideDeleteOpen} onOpenChange={setOverrideDeleteOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Delete anyway (Admin Override)</DialogTitle>
+            <DialogDescription>
+              This unit is verified and locked. Static admin credentials will be
+              used.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-3">
+            <div className="rounded-md border p-2 text-sm">
+              <div className="text-muted-foreground">Unit</div>
+              <div className="font-mono">{overrideTarget?.unit_code}</div>
+            </div>
+
+            {/* kept inputs (readonly) so no feature removed */}
+            <div className="text-sm font-medium mb-1">Username</div>
+            <Input
+              value={overrideEmail}
+              onChange={(e) => setOverrideEmail(e.target.value)}
+              placeholder="Enter override username"
+            />
+
+            <div className="text-sm font-medium mb-1">Password</div>
+            <Input
+              type="password"
+              value={overridePassword}
+              onChange={(e) => setOverridePassword(e.target.value)}
+              placeholder="Enter override password"
+            />
+          </div>
+
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setOverrideDeleteOpen(false)}
+              disabled={overrideWorking}
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={runOverrideDelete}
+              disabled={overrideWorking}
+            >
+              {overrideWorking ? "Verifying…" : "Delete anyway"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* ✅ Status Override Dialog */}
+      <Dialog open={statusOverrideOpen} onOpenChange={setStatusOverrideOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Admin authorization required</DialogTitle>
+            <DialogDescription>
+              Changing status to <b>{statusOverrideNext ?? "-"}</b> requires
+              admin credentials (static).
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-3">
+            <div className="rounded-md border p-2 text-sm">
+              <div className="text-muted-foreground">Unit</div>
+              <div className="font-mono">{statusOverrideUnit?.unit_code}</div>
+              <div className="text-muted-foreground mt-1">
+                Current: <b>{statusOverrideUnit?.status}</b> → Next:{" "}
+                <b>{statusOverrideNext}</b>
+              </div>
+            </div>
+
+            {/* kept inputs (readonly) so no feature removed */}
+            <div className="text-sm font-medium mb-1">Username</div>
+            <Input
+              value={statusOverrideEmail}
+              onChange={(e) => setStatusOverrideEmail(e.target.value)}
+              placeholder="Enter override username"
+            />
+
+            <div className="text-sm font-medium mb-1">Password</div>
+            <Input
+              type="password"
+              value={statusOverridePassword}
+              onChange={(e) => setStatusOverridePassword(e.target.value)}
+              placeholder="Enter override password"
+            />
+          </div>
+
+          <DialogFooter className="gap-2">
+            <Button
+              variant="outline"
+              onClick={() => {
+                setStatusOverrideOpen(false);
+                setStatusOverrideUnit(null);
+                setStatusOverrideNext(null);
+              }}
+              disabled={statusOverrideWorking}
+            >
+              Cancel
+            </Button>
+
+            <Button
+              onClick={async () => {
+                if (!vendor?.id || !statusOverrideUnit || !statusOverrideNext)
+                  return;
+
+                const username = statusOverrideEmail.trim();
+                const password = statusOverridePassword;
+
+                if (!username || !password) {
+                  toast.error("Enter override username and password");
+                  return;
+                }
+
+                // ✅ Static auth gate
+                if (!checkStaticOverride(username, password)) {
+                  toast.error("Invalid override credentials");
+                  return;
+                }
+
+                setStatusOverrideWorking(true);
+                try {
+                  // If next is SOLD => open SOLD dialog (after override)
+                  if (statusOverrideNext === "SOLD") {
+                    setSoldAuthOk(true); // ✅ allow Save SOLD
+                    setStatusOverrideOpen(false);
+
+                    setSoldTargetUnit(statusOverrideUnit);
+                    resetSoldForm();
+
+                    if (statusOverrideUnit.sold_customer_name)
+                      setCustName(statusOverrideUnit.sold_customer_name ?? "");
+                    if (statusOverrideUnit.sold_customer_phone)
+                      setCustPhone(
+                        statusOverrideUnit.sold_customer_phone ?? ""
+                      );
+
+                    // Clear override inputs so next time must re-enter
+                    setStatusOverrideEmail("");
+                    setStatusOverridePassword("");
+
+                    setSoldDialogOpen(true);
+                    return;
+                  }
+
+                  // Otherwise do status update via normal supabase client
+                  const { error } = await supabase
+                    .from("inventory_units")
+                    .update({ status: statusOverrideNext })
+                    .eq("id", statusOverrideUnit.id)
+                    .eq("vendor_id", vendor.id)
+                    .eq("product_id", productId);
+
+                  if (error) {
+                    toast.error(
+                      error.message || "Override status update failed"
+                    );
+                    return;
+                  }
+
+                  toast.success(
+                    `Status updated to ${statusOverrideNext} (override)`
+                  );
+
+                  if (scannedUnit?.id === statusOverrideUnit.id) {
+                    setScannedUnit((prev) =>
+                      prev ? { ...prev, status: statusOverrideNext } : prev
+                    );
+                  }
+
+                  setStatusOverrideOpen(false);
+                  setStatusOverrideUnit(null);
+                  setStatusOverrideNext(null);
+
+                  // Clear override inputs so next time must re-enter
+                  setStatusOverrideEmail("");
+                  setStatusOverridePassword("");
+
+                  await fetchUnits();
+                } finally {
+                  setStatusOverrideWorking(false);
+                }
+              }}
+              disabled={statusOverrideWorking}
+            >
+              {statusOverrideWorking ? "Verifying…" : "Authorize"}
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -2145,10 +4633,8 @@ export default function ProductUnitsPage({
                   <SelectContent className="bg-background">
                     <SelectItem value="NO_CHANGE">No change</SelectItem>
                     <SelectItem value="IN_STOCK">IN_STOCK</SelectItem>
-                    <SelectItem value="INVOICED">INVOICED</SelectItem>
                     <SelectItem value="DEMO">DEMO</SelectItem>
                     <SelectItem value="RETURNED">RETURNED</SelectItem>
-                    {/* <SelectItem value="OUT_OF_STOCK">OUT_OF_STOCK</SelectItem> */}
                   </SelectContent>
                 </Select>
               </div>
@@ -2173,10 +4659,6 @@ export default function ProductUnitsPage({
                   value={bulkNewExpDate}
                   onChange={(e) => setBulkNewExpDate(e.target.value)}
                 />
-                <div className="text-xs text-muted-foreground">
-                  Note: this updates expiry_date to the given date. (No option
-                  here to set expiry to null yet.)
-                </div>
               </div>
             </div>
           </div>
@@ -2196,7 +4678,7 @@ export default function ProductUnitsPage({
         </DialogContent>
       </Dialog>
 
-      {/* Bulk Delete Dialog */}
+      {/* ✅ Bulk Delete Dialog */}
       <Dialog open={bulkDeleteOpen} onOpenChange={setBulkDeleteOpen}>
         <DialogContent className="sm:max-w-[560px]">
           <DialogHeader>
@@ -2216,9 +4698,14 @@ export default function ProductUnitsPage({
 
           <div className="space-y-3">
             <div className="text-sm text-muted-foreground">Scope</div>
+
             <Select
               value={bulkDeleteScope}
-              onValueChange={(v) => setBulkDeleteScope(v as any)}
+              onValueChange={(v) => {
+                const next = v as any;
+                setBulkDeleteScope(next);
+                computeBulkDeleteMeta(next);
+              }}
             >
               <SelectTrigger className="w-[260px]">
                 <SelectValue />
@@ -2233,14 +4720,124 @@ export default function ProductUnitsPage({
               </SelectContent>
             </Select>
 
-            <div className="text-sm text-muted-foreground">
-              Type <b>DELETE</b> to confirm:
+            <div className="rounded-md border p-3 text-sm">
+              <div>
+                Target units:{" "}
+                <b>
+                  {bulkDeleteScope === "SELECTED"
+                    ? selectedIds.size
+                    : totalCount}
+                </b>
+              </div>
+
+              <div className="mt-1">
+                Verified in target:{" "}
+                <b>{bulkDeleteMetaLoading ? "…" : bulkDeleteVerifiedCount}</b>
+                {bulkDeleteVerifiedCount > 0 ? (
+                  <span className="text-xs text-muted-foreground">
+                    {" "}
+                    • Choose delete mode
+                  </span>
+                ) : null}
+              </div>
             </div>
-            <Input
-              value={bulkDeleteConfirm}
-              onChange={(e) => setBulkDeleteConfirm(e.target.value)}
-              placeholder='Type "DELETE"'
-            />
+
+            {bulkDeleteVerifiedCount > 0 ? (
+              <div className="rounded-md border p-3 space-y-2">
+                <div className="text-sm font-medium">
+                  Verified units detected
+                </div>
+
+                <label className="flex items-start gap-2 text-sm">
+                  <input
+                    type="radio"
+                    name="bulkDeleteMode"
+                    checked={bulkDeleteMode === "DELETE_ALL"}
+                    onChange={() => setBulkDeleteMode("DELETE_ALL")}
+                  />
+                  <div>
+                    <div className="font-medium">
+                      Delete ALL units (including verified)
+                    </div>
+                    <div className="text-xs text-muted-foreground">
+                      Uses static admin credentials.
+                    </div>
+                  </div>
+                </label>
+
+                <label className="flex items-start gap-2 text-sm">
+                  <input
+                    type="radio"
+                    name="bulkDeleteMode"
+                    checked={bulkDeleteMode === "SKIP_VERIFIED"}
+                    onChange={() => setBulkDeleteMode("SKIP_VERIFIED")}
+                  />
+                  <div>
+                    <div className="font-medium">
+                      Delete ONLY non-verified units
+                    </div>
+                    <div className="text-xs text-muted-foreground">
+                      Verified units will be skipped (no admin required).
+                    </div>
+                  </div>
+                </label>
+              </div>
+            ) : null}
+
+            <div className="space-y-1">
+              <div className="text-sm font-medium">Your name</div>
+              <Input
+                value={bulkDeleteName}
+                onChange={(e) => setBulkDeleteName(e.target.value)}
+                placeholder="Enter your name (for audit log)"
+              />
+            </div>
+
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={bulkDeleteAck}
+                onChange={(e) => setBulkDeleteAck(e.target.checked)}
+              />
+              I acknowledge this will permanently delete units and cannot be
+              undone.
+            </label>
+
+            {bulkDeleteVerifiedCount > 0 && bulkDeleteMode === "DELETE_ALL" ? (
+              <div className="rounded-md border p-3 space-y-2">
+                <div className="text-sm font-medium">
+                  Admin override (static)
+                </div>
+
+                <div>
+                  <div className="text-sm font-medium mb-1">Username</div>
+                  <Input
+                    value={bulkDeleteAdminEmail}
+                    onChange={(e) => setBulkDeleteAdminEmail(e.target.value)}
+                    placeholder="Enter override username"
+                  />
+
+                  <div className="text-sm font-medium mb-1">Password</div>
+                  <Input
+                    type="password"
+                    value={bulkDeleteAdminPassword}
+                    onChange={(e) => setBulkDeleteAdminPassword(e.target.value)}
+                    placeholder="Enter override password"
+                  />
+                </div>
+              </div>
+            ) : (
+              <>
+                <div className="text-sm text-muted-foreground">
+                  Type <b>DELETE</b> to confirm:
+                </div>
+                <Input
+                  value={bulkDeleteConfirm}
+                  onChange={(e) => setBulkDeleteConfirm(e.target.value)}
+                  placeholder='Type "DELETE"'
+                />
+              </>
+            )}
           </div>
 
           <DialogFooter className="gap-2">
@@ -2270,6 +4867,7 @@ export default function ProductUnitsPage({
           if (!v) {
             setSoldTargetUnit(null);
             resetSoldForm();
+            setSoldAuthOk(false);
           }
         }}
       >
@@ -2387,6 +4985,7 @@ export default function ProductUnitsPage({
                 setSoldDialogOpen(false);
                 setSoldTargetUnit(null);
                 resetSoldForm();
+                setSoldAuthOk(false);
               }}
             >
               Cancel
@@ -2395,6 +4994,7 @@ export default function ProductUnitsPage({
             <Button
               onClick={saveSoldWithCustomer}
               disabled={!soldTargetUnit || updatingId === soldTargetUnit?.id}
+              title={!soldAuthOk ? "Admin authorization required" : undefined}
             >
               {updatingId === soldTargetUnit?.id
                 ? "Saving…"
