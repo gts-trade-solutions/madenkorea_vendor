@@ -12,6 +12,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { FileText } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -63,7 +64,7 @@ type ProductUnitAgg = {
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
   process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
-  { auth: { persistSession: true, autoRefreshToken: true } }
+  { auth: { persistSession: true, autoRefreshToken: true } },
 );
 
 function coerceVendor(data: any): VendorInfo | null {
@@ -133,7 +134,9 @@ export default function VendorDashboard() {
     let cancelled = false;
 
     (async () => {
-      const { data: { session } } = await supabase.auth.getSession();
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
 
       if (!session?.user) {
         setHydrated(true);
@@ -169,7 +172,9 @@ export default function VendorDashboard() {
       setLoading(false);
     })();
 
-    const { data: sub } = supabase.auth.onAuthStateChange(() => setHydrated(true));
+    const { data: sub } = supabase.auth.onAuthStateChange(() =>
+      setHydrated(true),
+    );
 
     return () => {
       cancelled = true;
@@ -294,7 +299,16 @@ export default function VendorDashboard() {
       }
 
       // Sort expiring: earliest expiry first
-      expList.sort((a, b) => a.expiry_date.localeCompare(b.expiry_date));
+expList.sort((a, b) => {
+  // expired first
+  const ax = a.days_left < 0 ? 0 : 1;
+  const bx = b.days_left < 0 ? 0 : 1;
+  if (ax !== bx) return ax - bx;
+
+  // then closest expiry
+  return a.days_left - b.days_left;
+});
+
       setExpiringUnits(expList.slice(0, 25));
 
       // stats
@@ -313,7 +327,8 @@ export default function VendorDashboard() {
 
         // product-level stock flags
         if (a.in_stock === 0) outOfStockProducts += 1;
-        else if (a.in_stock > 0 && a.in_stock <= lowStockThreshold) lowStockProducts += 1;
+        else if (a.in_stock > 0 && a.in_stock <= lowStockThreshold)
+          lowStockProducts += 1;
       }
 
       // unit-level expiry counts (IN_STOCK/INVOICED/DEMO only)
@@ -371,7 +386,10 @@ export default function VendorDashboard() {
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
-            <Button className="w-full" onClick={() => router.push("/vendor/register")}>
+            <Button
+              className="w-full"
+              onClick={() => router.push("/vendor/register")}
+            >
               Create Vendor Account
             </Button>
             <div className="text-xs text-muted-foreground text-center">
@@ -395,7 +413,8 @@ export default function VendorDashboard() {
             <Hourglass className="h-10 w-10 mx-auto text-amber-500 mb-2" />
             <CardTitle className="text-2xl">Application in Review</CardTitle>
             <CardDescription>
-              Thanks, <b>{vendor.display_name}</b>. We’ll notify you once approved.
+              Thanks, <b>{vendor.display_name}</b>. We’ll notify you once
+              approved.
             </CardDescription>
           </CardHeader>
           <CardContent>
@@ -415,10 +434,14 @@ export default function VendorDashboard() {
           <CardHeader>
             <ShieldAlert className="h-10 w-10 mx-auto text-red-500 mb-2" />
             <CardTitle className="text-2xl">
-              {vendor.status === "rejected" ? "Application Rejected" : "Account Disabled"}
+              {vendor.status === "rejected"
+                ? "Application Rejected"
+                : "Account Disabled"}
             </CardTitle>
             <CardDescription>
-              {vendor.rejected_reason ? `Reason: ${vendor.rejected_reason}` : "Please contact support."}
+              {vendor.rejected_reason
+                ? `Reason: ${vendor.rejected_reason}`
+                : "Please contact support."}
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-3">
@@ -445,7 +468,9 @@ export default function VendorDashboard() {
           <div className="flex items-center gap-4">
             <span className="text-sm text-muted-foreground">
               {vendor.display_name}
-              {(vendorEmail || user?.email) ? <> · {vendorEmail ?? user?.email}</> : null}
+              {vendorEmail || user?.email ? (
+                <> · {vendorEmail ?? user?.email}</>
+              ) : null}
             </span>
             <Button variant="outline" size="sm" onClick={handleLogout}>
               <LogOut className="mr-2 h-4 w-4" />
@@ -472,7 +497,9 @@ export default function VendorDashboard() {
               </CardTitle>
             </CardHeader>
             <CardContent>
-              <div className="text-3xl font-bold">{unitStats.productsWithUnits}</div>
+              <div className="text-3xl font-bold">
+                {unitStats.productsWithUnits}
+              </div>
               <p className="text-xs text-muted-foreground mt-1">
                 Total units: {unitStats.totalUnits}
               </p>
@@ -490,7 +517,8 @@ export default function VendorDashboard() {
                 {unitStats.outOfStockProducts + unitStats.lowStockProducts}
               </div>
               <p className="text-xs text-muted-foreground mt-1">
-                Out: {unitStats.outOfStockProducts} • Low: {unitStats.lowStockProducts}
+                Out: {unitStats.outOfStockProducts} • Low:{" "}
+                {unitStats.lowStockProducts}
               </p>
             </CardContent>
           </Card>
@@ -502,7 +530,9 @@ export default function VendorDashboard() {
               </CardTitle>
             </CardHeader>
             <CardContent>
-              <div className="text-3xl font-bold">{unitStats.expiringUnits}</div>
+              <div className="text-3xl font-bold">
+                {unitStats.expiringUnits}
+              </div>
               <p className="text-xs text-muted-foreground mt-1">
                 Within {alertDays} days
               </p>
@@ -525,58 +555,120 @@ export default function VendorDashboard() {
         </div>
 
         {/* Expiring UNITS list */}
-        <Card>
-          <CardHeader>
-            <CardTitle>Unit Expiry Alerts</CardTitle>
-            <CardDescription>
-              Units expiring within the next {alertDays} days (includes already expired). Sorted by expiry date.
-            </CardDescription>
-          </CardHeader>
+<Card>
+  <CardHeader className="flex flex-row items-start justify-between gap-4">
+    <div>
+      <CardTitle>Unit Expiry Alerts</CardTitle>
+      <CardDescription>
+        Units expiring within the next {alertDays} days (includes already expired).
+      </CardDescription>
+    </div>
 
-          <CardContent className="space-y-2">
-            {expiringUnits.length === 0 ? (
-              <div className="text-sm text-muted-foreground">
-                No units expiring within the alert window.
-              </div>
-            ) : (
-              expiringUnits.map((u) => (
-                <div
-                  key={u.unit_id}
-                  className="flex items-center justify-between border rounded-md p-3"
-                >
-                  <div className="min-w-0">
-                    <div className="font-medium truncate">{u.product_name}</div>
-                    <div className="text-xs text-muted-foreground">
-                      Unit: <span className="font-mono">{u.unit_code}</span> • Status: {u.status}
-                    </div>
-                    <div className="text-xs text-muted-foreground">
-                      Expiry: {u.expiry_date}
-                    </div>
-                  </div>
+    <div className="flex items-center gap-2">
+      <Button
+        size="sm"
+        variant="outline"
+        onClick={() => router.push("/vendor/alerts")}
+      >
+        View All
+      </Button>
+      <Button
+        size="sm"
+        onClick={() => router.push("/vendor/alerts?tab=expired")}
+      >
+        Expired
+      </Button>
+    </div>
+  </CardHeader>
 
-                  <div className="flex items-center gap-2">
-                    <span
-                      className={`text-xs px-2 py-1 rounded ${expiryClass(u.days_left, alertDays)}`}
-                    >
-                      {u.days_left < 0 ? `${Math.abs(u.days_left)}d expired` : `${u.days_left}d left`}
-                    </span>
-
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      onClick={() => router.push(`/vendor/products/${u.product_id}/units`)}
-                    >
-                      Open Units
-                    </Button>
-                  </div>
+  <CardContent>
+    {expiringUnits.length === 0 ? (
+      <div className="text-sm text-muted-foreground">
+        No units expiring within the alert window.
+      </div>
+    ) : (
+      <>
+        {/* ✅ Scroll container (does not push page down) */}
+        <div className="max-h-[360px] overflow-auto space-y-2 pr-2">
+          {expiringUnits.slice(0, 12).map((u) => (
+            <div
+              key={u.unit_id}
+              className="flex items-center justify-between border rounded-md p-3"
+            >
+              <div className="min-w-0">
+                <div className="font-medium truncate">{u.product_name}</div>
+                <div className="text-xs text-muted-foreground">
+                  Unit: <span className="font-mono">{u.unit_code}</span> • Status:{" "}
+                  {u.status}
                 </div>
-              ))
-            )}
-          </CardContent>
-        </Card>
+                <div className="text-xs text-muted-foreground">
+                  Expiry: {u.expiry_date}
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <span
+                  className={`text-xs px-2 py-1 rounded ${expiryClass(
+                    u.days_left,
+                    alertDays,
+                  )}`}
+                >
+                  {u.days_left < 0
+                    ? `${Math.abs(u.days_left)}d expired`
+                    : `${u.days_left}d left`}
+                </span>
+
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => router.push(`/vendor/products/${u.product_id}/units`)}
+                >
+                  Open Units
+                </Button>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {/* ✅ footer hint */}
+        <div className="mt-3 flex items-center justify-between text-xs text-muted-foreground">
+          <span>
+            Showing {Math.min(12, expiringUnits.length)} of {expiringUnits.length}
+          </span>
+          <button
+            className="underline"
+            onClick={() => router.push("/vendor/alerts")}
+          >
+            View full list →
+          </button>
+        </div>
+      </>
+    )}
+  </CardContent>
+</Card>
 
         {/* Quick actions */}
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+          <Card className="hover:shadow-lg transition-shadow">
+            <CardHeader>
+              <FileText className="h-8 w-8 mb-2 text-primary" />
+              <CardTitle>Invoices</CardTitle>
+              <CardDescription>Create and manage invoices</CardDescription>
+            </CardHeader>
+            <CardContent>
+              <p className="text-sm text-muted-foreground mb-4">
+                Generate, edit and print invoices from the vendor portal.
+              </p>
+              <Button
+                variant="outline"
+                className="w-full"
+                onClick={() => router.push("/vendor/invoices")}
+              >
+                Open Invoices
+              </Button>
+            </CardContent>
+          </Card>
+
           <Card className="hover:shadow-lg transition-shadow">
             <CardHeader>
               <Package className="h-8 w-8 mb-2 text-primary" />
