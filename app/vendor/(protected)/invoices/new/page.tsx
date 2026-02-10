@@ -27,11 +27,6 @@ import { QuickAddAddressDialog } from "@/components/addresses/QuickAddAddressDia
 
 const SUPPORT_EMAIL_FALLBACK = "info@madenkorea.com";
 
-// ✅ IMPORTANT: change this if your website products table uses a different price column
-// Example: "sale_price" or "selling_price" or "mrp" etc.
-const PRODUCTS_TABLE = "products";
-const PRODUCTS_PRICE_COLUMN = "price";
-
 type InvoiceCompany = {
   id: string;
   key: string;
@@ -41,22 +36,25 @@ type InvoiceCompany = {
   email: string | null;
 };
 
+type TaxType = "CGST_SGST" | "IGST" | "NONE";
+
 type ProductSuggestion = {
   id: string;
   name: string;
-  price: number | null;
+  brand_name: string | null;
+  mrp: number | null;
 };
 
-type InvoiceItem = {
-  id: string; // local id for React key
-  description: string; // product name / description
-  product_id?: string | null; // NEW: website product id when web-generated
 
-  hsn_sac: string;
+type InvoiceItem = {
+  id: string;
+  product_id?: string | null;
+  brand: string;
+  description: string;
+  hsn: string;
+  mrp: number; // ✅ ONLY price column used for calculations
   quantity: number;
-  unit_price: number;
   discount: number;
-  tax_percent: number;
 };
 
 type InvoiceAddress = {
@@ -84,23 +82,36 @@ Return Policy
 • Returns are only accepted for products with damaged packaging or expired items.
 • Used products or items with broken or tampered seals are not eligible for return.`;
 
+// ✅ INR format with Indian commas
+const inr = new Intl.NumberFormat("en-IN", {
+  style: "currency",
+  currency: "INR",
+  minimumFractionDigits: 2,
+  maximumFractionDigits: 2,
+});
+const fmtINR = (v: any) =>
+  inr.format(Number.isFinite(Number(v)) ? Number(v) : 0);
+
 function createEmptyItem(): InvoiceItem {
   return {
     id: crypto.randomUUID(),
-    description: "",
     product_id: null,
-    hsn_sac: "",
+    brand: "",
+    description: "",
+    hsn: "",
+    mrp: 0,
     quantity: 1,
-    unit_price: 0,
     discount: 0,
-    tax_percent: 0,
   };
 }
 
 export default function NewInvoicePage() {
   const router = useRouter();
 
-  
+  const [taxType, setTaxType] = useState<TaxType>("CGST_SGST");
+  const [cgstPercent, setCgstPercent] = useState<number>(9);
+  const [sgstPercent, setSgstPercent] = useState<number>(9);
+  const [igstPercent, setIgstPercent] = useState<number>(18);
 
   const [companies, setCompanies] = useState<InvoiceCompany[]>([]);
   const [loadingCompanies, setLoadingCompanies] = useState<boolean>(false);
@@ -112,7 +123,7 @@ export default function NewInvoicePage() {
   const [addresses, setAddresses] = useState<InvoiceAddress[]>([]);
   const [selectedAddressId, setSelectedAddressId] = useState<string>("");
 
-  // ✅ Suggestions per-row for better UX
+  // ✅ Suggestions per-row
   const [productSuggestionsByItem, setProductSuggestionsByItem] = useState<
     Record<string, ProductSuggestion[]>
   >({});
@@ -126,7 +137,6 @@ export default function NewInvoicePage() {
 
   // --- Invoice form state ---
   const [companyId, setCompanyId] = useState<string>("");
-  const [invoiceNumber, setInvoiceNumber] = useState<string>("");
   const [invoiceDate, setInvoiceDate] = useState<string>("");
   const [dueDate, setDueDate] = useState<string>("");
 
@@ -179,7 +189,6 @@ export default function NewInvoicePage() {
       } = await supabase.auth.getUser();
       if (!user) return;
 
-      // If vendor_id differs, map here (profiles etc.)
       const vendorId = user.id;
 
       const { data, error } = await supabase
@@ -198,25 +207,6 @@ export default function NewInvoicePage() {
 
     loadAddresses();
   }, []);
-
-  // --- Totals calculation ---
-  const { subtotal, taxAmount, totalAmount } = useMemo(() => {
-    let sub = 0;
-    let tax = 0;
-
-    for (const item of items) {
-      const lineSubtotal = item.quantity * item.unit_price - item.discount;
-      const lineTax = (lineSubtotal * item.tax_percent) / 100;
-      sub += lineSubtotal;
-      tax += lineTax;
-    }
-
-    return {
-      subtotal: Number(sub.toFixed(2)),
-      taxAmount: Number(tax.toFixed(2)),
-      totalAmount: Number((sub + tax).toFixed(2)),
-    };
-  }, [items]);
 
   const sellerSupportEmail = selectedCompany?.email || SUPPORT_EMAIL_FALLBACK;
 
@@ -254,6 +244,47 @@ export default function NewInvoicePage() {
     setBillingAddress(fullAddress);
   };
 
+  // --- Totals calculation (MRP only) ---
+  const { subtotal, discountTotal, taxableAmount } = useMemo(() => {
+    let sub = 0;
+    let disc = 0;
+
+    for (const item of items) {
+      const lineBase = item.quantity * item.mrp;
+      sub += lineBase;
+      disc += item.discount;
+    }
+
+    const taxable = sub - disc;
+
+    return {
+      subtotal: Number(sub.toFixed(2)),
+      discountTotal: Number(disc.toFixed(2)),
+      taxableAmount: Number(taxable.toFixed(2)),
+    };
+  }, [items]);
+
+  // --- Tax calculation ---
+  const { cgstAmount, sgstAmount, igstAmount, taxTotal, grandTotal } =
+    useMemo(() => {
+      const taxable = taxableAmount;
+
+      const cgst = taxType === "CGST_SGST" ? (taxable * cgstPercent) / 100 : 0;
+      const sgst = taxType === "CGST_SGST" ? (taxable * sgstPercent) / 100 : 0;
+      const igst = taxType === "IGST" ? (taxable * igstPercent) / 100 : 0;
+
+      const tax = cgst + sgst + igst;
+      const grand = taxable + tax;
+
+      return {
+        cgstAmount: Number(cgst.toFixed(2)),
+        sgstAmount: Number(sgst.toFixed(2)),
+        igstAmount: Number(igst.toFixed(2)),
+        taxTotal: Number(tax.toFixed(2)),
+        grandTotal: Number(grand.toFixed(2)),
+      };
+    }, [taxableAmount, taxType, cgstPercent, sgstPercent, igstPercent]);
+
   // --- Fetch suggestions per-row (web-generated mode only) ---
   const fetchProductSuggestions = async (itemId: string, query: string) => {
     if (isCustom) return;
@@ -264,43 +295,43 @@ export default function NewInvoicePage() {
       return;
     }
 
-    // Build select string safely for supabase
-    const selectCols = `id,name,${PRODUCTS_PRICE_COLUMN}`;
+const { data, error } = await supabase
+  .from("products")
+  .select(
+    `
+      id,
+      name,
+      brand_id,
+      compare_at_price,
+      brands:brands(name)
+    `,
+  )
+  .ilike("name", `%${q}%`)
+  .limit(10);
 
-    const { data, error } = await supabase
-      .from(PRODUCTS_TABLE)
-      .select(selectCols)
-      .ilike("name", `%${q}%`)
-      .limit(10);
 
     if (error) {
-      console.error("Product suggestion error", error);
       setProductSuggestionsByItem((prev) => ({ ...prev, [itemId]: [] }));
       return;
     }
 
-    // map price key into "price"
-    const mapped =
-      (data || []).map((row: any) => ({
-        id: row.id,
-        name: row.name,
-        price:
-          row?.[PRODUCTS_PRICE_COLUMN] == null
-            ? null
-            : Number(row?.[PRODUCTS_PRICE_COLUMN]),
-      })) ?? [];
+const mapped: ProductSuggestion[] = (data || []).map((p: any) => ({
+  id: p.id,
+  name: p.name,
+  brand_name: p.brands?.name ?? null,
+  mrp: p.compare_at_price == null ? null : Number(p.compare_at_price),
+}));
+
 
     setProductSuggestionsByItem((prev) => ({ ...prev, [itemId]: mapped }));
   };
 
-  // --- Submit ---
+  // --- Submit (invoice_number removed; DB should auto-generate) ---
   const handleSave = async () => {
     setError(null);
     setSuccessMessage(null);
 
     if (!companyId) return setError("Please select the invoice company.");
-    if (!invoiceNumber.trim())
-      return setError("Please enter an invoice number.");
     if (!customerName.trim()) return setError("Please enter customer name.");
     if (!billingAddress.trim())
       return setError("Please enter billing address.");
@@ -308,7 +339,6 @@ export default function NewInvoicePage() {
     if (items.every((it) => !it.description.trim()))
       return setError("Please enter at least one line item description.");
 
-    // Enforce website product selection when NOT custom
     if (!isCustom) {
       const invalid = items
         .filter((it) => it.description.trim())
@@ -323,13 +353,12 @@ export default function NewInvoicePage() {
     setSaving(true);
 
     try {
-      // 1) Insert invoice
       const { data: invoiceData, error: invoiceError } = await supabase
         .from("invoices")
         .insert([
           {
             company_id: companyId,
-            invoice_number: invoiceNumber,
+            // ✅ invoice_number not passed (auto generated in DB)
             invoice_date: invoiceDate || null,
             due_date: dueDate || null,
 
@@ -342,12 +371,23 @@ export default function NewInvoicePage() {
             pan_number: panNumber || null,
 
             subtotal,
-            tax_amount: taxAmount,
-            total_amount: totalAmount,
+            discount_total: discountTotal,
+
+            tax_type: taxType,
+            cgst_percent: taxType === "CGST_SGST" ? cgstPercent : 0,
+            sgst_percent: taxType === "CGST_SGST" ? sgstPercent : 0,
+            igst_percent: taxType === "IGST" ? igstPercent : 0,
+
+            cgst_amount: cgstAmount,
+            sgst_amount: sgstAmount,
+            igst_amount: igstAmount,
+
+            tax_amount: taxTotal,
+            grand_total: grandTotal,
+            total_amount: grandTotal,
 
             notes: notes || null,
 
-            // NEW fields (ensure DB columns exist)
             is_custom: isCustom,
             bill_to_address_id: selectedAddressId || null,
           },
@@ -362,29 +402,22 @@ export default function NewInvoicePage() {
 
       const invoiceId = invoiceData.id as string;
 
-      // 2) Insert invoice items
       const itemsToInsert = items
         .filter((it) => it.description.trim())
         .map((it, index) => {
-          const lineSubtotal = it.quantity * it.unit_price - it.discount;
-          const lineTax = (lineSubtotal * it.tax_percent) / 100;
-          const lineTotal = lineSubtotal + lineTax;
+          const lineSubtotal = it.quantity * it.mrp - it.discount;
 
           return {
             invoice_id: invoiceId,
-
-            // NEW
-            product_id: it.product_id || null,
-
+            product_id: it.product_id ?? null,
+            brand: it.brand || null,
             description: it.description,
-            hsn_sac: it.hsn_sac || null,
+            hsn: it.hsn || null,
             quantity: it.quantity,
-            unit_price: it.unit_price,
+            unit_price: it.mrp, // ✅ keep DB column same, store MRP into unit_price
             discount: it.discount,
-            tax_percent: it.tax_percent,
             line_subtotal: Number(lineSubtotal.toFixed(2)),
-            line_tax_amount: Number(lineTax.toFixed(2)),
-            line_total: Number(lineTotal.toFixed(2)),
+            line_total: Number(lineSubtotal.toFixed(2)),
             position: index,
           };
         });
@@ -414,13 +447,11 @@ export default function NewInvoicePage() {
 
   return (
     <div className="container mx-auto max-w-6xl py-6 space-y-6">
-      {/* Mode + Address selection */}
-       <Button
-          variant="outline"
-          onClick={() => router.push("/vendor/invoices")}
-        >
-          Back to Invoices
-        </Button>
+      <Button variant="outline" onClick={() => router.push("/vendor/invoices")}>
+        ← Back to Invoices
+      </Button>
+
+      {/* Mode + Address */}
       <Card>
         <CardContent className="pt-6 space-y-4">
           <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
@@ -433,12 +464,9 @@ export default function NewInvoicePage() {
                   const next = e.target.checked;
                   setIsCustom(next);
 
-                  // reset all product_id when switching modes
                   setItems((prev) =>
                     prev.map((it) => ({ ...it, product_id: null })),
                   );
-
-                  // clear suggestions
                   setProductSuggestionsByItem({});
                   setActiveSuggestForItemId(null);
                 }}
@@ -451,42 +479,35 @@ export default function NewInvoicePage() {
 
             <div className="text-xs text-muted-foreground">
               {isCustom
-                ? "You can type any item name and price."
-                : "Type to search website products. Select from suggestions to lock product name, then edit price/discount if needed."}
+                ? "You can type any item name and MRP."
+                : "Type product name → select suggestion → Brand & HSN will auto-fill. You can edit MRP/Discount."}
             </div>
           </div>
 
           <div className="grid gap-2">
-
-
             <div className="flex items-center justify-between">
-  <Label>Bill To Address (prefill)</Label>
+              <Label>Bill To Address (prefill)</Label>
 
-  <div className="flex items-center gap-2">
-    <QuickAddAddressDialog
-      triggerText="Quick Add"
-      onCreated={(created) => {
-        // add new row to dropdown
-        setAddresses((prev) => [created as any, ...prev]);
+              <div className="flex items-center gap-2">
+                <QuickAddAddressDialog
+                  triggerText="Quick Add"
+                  onCreated={(created) => {
+                    setAddresses((prev) => [created as any, ...prev]);
+                    setSelectedAddressId(created.id);
+                    applyAddressToCustomerFields(created as any);
+                  }}
+                />
 
-        // select it
-        setSelectedAddressId(created.id);
-
-        // prefill fields
-        applyAddressToCustomerFields(created as any);
-      }}
-    />
-
-    <Button
-      type="button"
-      variant="outline"
-      size="sm"
-      onClick={() => router.push("/vendor/addresses")}
-    >
-      Manage
-    </Button>
-  </div>
-</div>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => router.push("/vendor/addresses")}
+                >
+                  Manage
+                </Button>
+              </div>
+            </div>
 
             <select
               value={selectedAddressId}
@@ -521,7 +542,7 @@ export default function NewInvoicePage() {
         <CardHeader>
           <CardTitle>Create Invoice</CardTitle>
           <CardDescription>
-            Generate an invoice for a customer and save it to the system.
+            Invoice number will be auto-generated when you save.
           </CardDescription>
         </CardHeader>
 
@@ -558,26 +579,19 @@ export default function NewInvoicePage() {
                 </SelectContent>
               </Select>
 
-              {/* Seller preview */}
               <div className="mt-2 rounded-md border bg-muted/30 p-2 text-xs text-slate-700">
                 <div className="font-medium">
                   Seller: {selectedCompany?.display_name || "-"}
                 </div>
-                <div>Support Email: {sellerSupportEmail}</div>
+                <div>
+                  Support Email:{" "}
+                  {selectedCompany?.email || SUPPORT_EMAIL_FALLBACK}
+                </div>
                 <div>GSTIN: {selectedCompany?.gst_number || "-"}</div>
                 <div className="whitespace-pre-line">
                   Address: {selectedCompany?.address || "-"}
                 </div>
               </div>
-            </div>
-
-            <div className="space-y-1">
-              <Label>Invoice Number</Label>
-              <Input
-                value={invoiceNumber}
-                onChange={(e) => setInvoiceNumber(e.target.value)}
-                placeholder="e.g. MK/2025/0001"
-              />
             </div>
 
             <div className="space-y-1">
@@ -608,7 +622,6 @@ export default function NewInvoicePage() {
                 <Input
                   value={customerName}
                   onChange={(e) => setCustomerName(e.target.value)}
-                  placeholder="Customer / Company Name"
                 />
               </div>
 
@@ -618,7 +631,6 @@ export default function NewInvoicePage() {
                   type="email"
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
-                  placeholder="Customer email (internal use)"
                 />
               </div>
 
@@ -627,7 +639,6 @@ export default function NewInvoicePage() {
                 <Input
                   value={phone}
                   onChange={(e) => setPhone(e.target.value)}
-                  placeholder="Customer mobile number"
                 />
               </div>
 
@@ -636,7 +647,6 @@ export default function NewInvoicePage() {
                 <Input
                   value={gstNumber}
                   onChange={(e) => setGstNumber(e.target.value)}
-                  placeholder="Customer GST Number"
                 />
               </div>
 
@@ -645,7 +655,6 @@ export default function NewInvoicePage() {
                 <Input
                   value={panNumber}
                   onChange={(e) => setPanNumber(e.target.value)}
-                  placeholder="Customer PAN Number"
                 />
               </div>
             </div>
@@ -655,7 +664,6 @@ export default function NewInvoicePage() {
               <Textarea
                 value={billingAddress}
                 onChange={(e) => setBillingAddress(e.target.value)}
-                placeholder="Full billing address"
                 rows={3}
               />
             </div>
@@ -679,116 +687,120 @@ export default function NewInvoicePage() {
               <table className="w-full min-w-max text-sm">
                 <thead className="bg-muted">
                   <tr>
-                    <th className="px-2 py-2 text-left">
-                      {isCustom ? "Description" : "Product (Website)"}
+                    <th className="px-2 py-2 text-left w-[60px]">Sl.No</th>
+                    <th className="px-2 py-2 text-left">Brand</th>
+                    <th className="px-2 py-2 text-left">Description</th>
+                    <th className="px-2 py-2 text-left w-[120px]">HSN</th>
+                    <th className="px-2 py-2 text-right w-[90px]">Qty</th>
+                    <th className="px-2 py-2 text-right w-[120px]">MRP</th>
+                    <th className="px-2 py-2 text-right w-[120px]">Discount</th>
+                    <th className="px-2 py-2 text-right w-[140px]">Amount</th>
+                    <th className="px-2 py-2 text-center w-[90px] print:hidden">
+                      Actions
                     </th>
-                    <th className="px-2 py-2 text-left">HSN/SAC</th>
-                    <th className="px-2 py-2 text-right">Qty</th>
-                    <th className="px-2 py-2 text-right">Unit Price</th>
-                    <th className="px-2 py-2 text-right">Discount</th>
-                    <th className="px-2 py-2 text-right">Tax %</th>
-                    <th className="px-2 py-2 text-right">Line Total</th>
-                    <th className="px-2 py-2 text-center">Actions</th>
                   </tr>
                 </thead>
 
                 <tbody>
-                  {items.map((item) => {
-                    const lineSubtotal =
-                      item.quantity * item.unit_price - item.discount;
-                    const lineTax = (lineSubtotal * item.tax_percent) / 100;
-                    const lineTotal = lineSubtotal + lineTax;
+                  {items.map((item, idx) => {
+                    const lineAmount = item.quantity * item.mrp - item.discount;
+
+                    const brandLocked = !isCustom && !!item.product_id;
+                    const hsnLocked = !isCustom && !!item.product_id;
 
                     return (
-                      <tr key={item.id} className="border-t">
-                        {/* ✅ User friendly product selector */}
-                        <td className="px-2 py-1 align-top relative">
-                          <div className="flex flex-col gap-1">
-                            <Input
-                              value={item.description}
-                              onFocus={() => {
-                                if (!isCustom)
-                                  setActiveSuggestForItemId(item.id);
-                              }}
-                              onBlur={() => {
-                                setTimeout(() => {
-                                  setActiveSuggestForItemId((prev) =>
-                                    prev === item.id ? null : prev,
-                                  );
-                                  setProductSuggestionsByItem((prev) => ({
-                                    ...prev,
-                                    [item.id]: [],
-                                  }));
-                                }, 150);
-                              }}
-                              onChange={(e) => {
-                                const v = e.target.value;
+                      <tr key={item.id} className="border-t align-top">
+                        <td className="px-2 py-2">{idx + 1}</td>
 
-                                if (isCustom) {
-                                  updateItem(item.id, { description: v });
-                                  return;
-                                }
+                        <td className="px-2 py-2">
+                          <Input
+                            value={item.brand}
+                            onChange={(e) =>
+                              updateItem(item.id, { brand: e.target.value })
+                            }
+                            placeholder="Brand"
+                            disabled={brandLocked}
+                          />
+                        </td>
 
-                                // web-generated: reset product_id until selected
-                                updateItem(item.id, {
-                                  description: v,
-                                  product_id: null,
-                                });
+                        <td className="px-2 py-2 relative">
+                          <Input
+                            value={item.description}
+                            onFocus={() =>
+                              !isCustom && setActiveSuggestForItemId(item.id)
+                            }
+                            onBlur={() => {
+                              setTimeout(() => {
+                                setActiveSuggestForItemId((prev) =>
+                                  prev === item.id ? null : prev,
+                                );
+                                setProductSuggestionsByItem((prev) => ({
+                                  ...prev,
+                                  [item.id]: [],
+                                }));
+                              }, 150);
+                            }}
+                            onChange={(e) => {
+                              const v = e.target.value;
 
-                                setActiveSuggestForItemId(item.id);
-                                fetchProductSuggestions(item.id, v);
-                              }}
-                              placeholder={
-                                isCustom
-                                  ? "Item / service description"
-                                  : "Search product..."
+                              if (isCustom) {
+                                updateItem(item.id, { description: v });
+                                return;
                               }
-                            />
 
-                            {!isCustom && item.product_id && (
-                              <div className="text-[11px] text-muted-foreground">
-                                Selected from website products ✅
-                              </div>
-                            )}
-                          </div>
+                              updateItem(item.id, {
+                                description: v,
+                                product_id: null,
+                                brand: "", // ✅ clear until user selects
+                                hsn: "", // ✅ clear until user selects
+                              });
+
+                              setActiveSuggestForItemId(item.id);
+                              fetchProductSuggestions(item.id, v);
+                            }}
+                            placeholder={
+                              isCustom
+                                ? "Product name"
+                                : "Search website product..."
+                            }
+                          />
 
                           {!isCustom &&
                             activeSuggestForItemId === item.id &&
                             (productSuggestionsByItem[item.id]?.length || 0) >
                               0 && (
                               <div className="absolute z-20 mt-1 w-full rounded-md border bg-white shadow-sm max-h-60 overflow-auto">
-                                {productSuggestionsByItem[item.id].map((p) => (
-                                  <button
-                                    key={p.id}
-                                    type="button"
-                                    className="w-full text-left px-3 py-2 hover:bg-muted flex items-center justify-between gap-3"
-                                    onMouseDown={(ev) => ev.preventDefault()}
-                                    onClick={() => {
-                                      updateItem(item.id, {
-                                        description: p.name,
-                                        product_id: p.id,
-                                        // ✅ auto-fill unit price from product, but still editable
-                                        unit_price:
-                                          p.price == null
-                                            ? item.unit_price
-                                            : Number(p.price),
-                                      });
+                                {productSuggestionsByItem[item.id].map(
+                                  (p: any) => (
+                                    <button
+                                      key={p.id}
+                                      type="button"
+                                      className="w-full text-left px-3 py-2 hover:bg-muted flex items-center justify-between gap-3"
+                                      onMouseDown={(ev) => ev.preventDefault()}
+                                      onClick={() => {
+                                        // ✅ Auto-fill Brand + HSN + MRP on selection
+                                        updateItem(item.id, {
+                                          description: p.name,
+                                          product_id: p.id,
+                                          brand: p.brand_name ?? "",
+                                          hsn: p.hsn ?? "",
+                                          mrp: p.mrp ?? 0,
+                                        });
 
-                                      setProductSuggestionsByItem((prev) => ({
-                                        ...prev,
-                                        [item.id]: [],
-                                      }));
-                                      setActiveSuggestForItemId(null);
-                                    }}
-                                  >
-                                    <span className="truncate">{p.name}</span>
-                                    <span className="text-xs text-slate-600">
-                                      {p.price != null
-                                        ? Number(p.price).toFixed(2)
-                                        : ""}
-                                    </span>
-                                  </button>
-                                ))}
+                                        setProductSuggestionsByItem((prev) => ({
+                                          ...prev,
+                                          [item.id]: [],
+                                        }));
+                                        setActiveSuggestForItemId(null);
+                                      }}
+                                    >
+                                      <span className="truncate">{p.name}</span>
+                                      <span className="text-xs text-slate-600">
+                                        {p.mrp != null ? fmtINR(p.mrp) : ""}
+                                      </span>
+                                    </button>
+                                  ),
+                                )}
                               </div>
                             )}
 
@@ -801,17 +813,18 @@ export default function NewInvoicePage() {
                             )}
                         </td>
 
-                        <td className="px-2 py-1 align-top">
+                        <td className="px-2 py-2">
                           <Input
-                            value={item.hsn_sac}
+                            value={item.hsn}
                             onChange={(e) =>
-                              updateItem(item.id, { hsn_sac: e.target.value })
+                              updateItem(item.id, { hsn: e.target.value })
                             }
-                            placeholder="HSN / SAC"
+                            placeholder="HSN"
+                            disabled={hsnLocked}
                           />
                         </td>
 
-                        <td className="px-2 py-1 align-top">
+                        <td className="px-2 py-2">
                           <Input
                             type="number"
                             min={0}
@@ -824,27 +837,21 @@ export default function NewInvoicePage() {
                           />
                         </td>
 
-                        {/* ✅ unit price is auto-filled but editable */}
-                        <td className="px-2 py-1 align-top">
+                        <td className="px-2 py-2">
                           <Input
                             type="number"
                             min={0}
                             step="0.01"
-                            value={item.unit_price.toString()}
+                            value={item.mrp.toString()}
                             onChange={(e) =>
                               updateItem(item.id, {
-                                unit_price: Number(e.target.value) || 0,
+                                mrp: Number(e.target.value) || 0,
                               })
                             }
                           />
-                          {!isCustom && (
-                            <div className="mt-1 text-[11px] text-muted-foreground">
-                              Auto-filled from product, you can edit
-                            </div>
-                          )}
                         </td>
 
-                        <td className="px-2 py-1 align-top">
+                        <td className="px-2 py-2">
                           <Input
                             type="number"
                             min={0}
@@ -858,25 +865,11 @@ export default function NewInvoicePage() {
                           />
                         </td>
 
-                        <td className="px-2 py-1 align-top">
-                          <Input
-                            type="number"
-                            min={0}
-                            step="0.01"
-                            value={item.tax_percent.toString()}
-                            onChange={(e) =>
-                              updateItem(item.id, {
-                                tax_percent: Number(e.target.value) || 0,
-                              })
-                            }
-                          />
+                        <td className="px-2 py-2 text-right font-medium">
+                          {fmtINR(lineAmount)}
                         </td>
 
-                        <td className="px-2 py-1 align-top text-right align-middle">
-                          {lineTotal.toFixed(2)}
-                        </td>
-
-                        <td className="px-2 py-1 text-center align-middle">
+                        <td className="px-2 py-2 text-center print:hidden">
                           <Button
                             type="button"
                             variant="ghost"
@@ -898,16 +891,111 @@ export default function NewInvoicePage() {
             <div className="mt-4 flex flex-col items-end space-y-1 text-sm">
               <div className="flex w-full max-w-sm justify-between">
                 <span>Subtotal</span>
-                <span>{subtotal.toFixed(2)}</span>
+                <span>{fmtINR(subtotal)}</span>
               </div>
+
               <div className="flex w-full max-w-sm justify-between">
-                <span>Tax</span>
-                <span>{taxAmount.toFixed(2)}</span>
+                <span>Discount</span>
+                <span>{fmtINR(discountTotal)}</span>
               </div>
-              <div className="flex w-full max-w-sm justify-between font-semibold">
-                <span>Total</span>
-                <span>{totalAmount.toFixed(2)}</span>
+
+              <div className="flex w-full max-w-sm justify-between">
+                <span className="text-muted-foreground">Taxable Amount</span>
+                <span className="font-medium">{fmtINR(taxableAmount)}</span>
               </div>
+
+              {taxType === "CGST_SGST" && (
+                <>
+                  <div className="flex w-full max-w-sm justify-between">
+                    <span>CGST</span>
+                    <span>{fmtINR(cgstAmount)}</span>
+                  </div>
+                  <div className="flex w-full max-w-sm justify-between">
+                    <span>SGST</span>
+                    <span>{fmtINR(sgstAmount)}</span>
+                  </div>
+                </>
+              )}
+
+              {taxType === "IGST" && (
+                <div className="flex w-full max-w-sm justify-between">
+                  <span>IGST</span>
+                  <span>{fmtINR(igstAmount)}</span>
+                </div>
+              )}
+
+              <div className="flex w-full max-w-sm justify-between font-semibold border-t pt-2 mt-2">
+                <span>Invoice Amount</span>
+                <span>{fmtINR(grandTotal)}</span>
+              </div>
+            </div>
+
+            {/* Tax config */}
+            <div className="mt-4 w-full max-w-sm rounded-md border p-3 text-sm">
+              <div className="font-semibold mb-2">Tax</div>
+
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-muted-foreground">Type</span>
+                <select
+                  value={taxType}
+                  onChange={(e) => setTaxType(e.target.value as TaxType)}
+                  className="border rounded-md px-2 py-1 text-sm"
+                >
+                  <option value="CGST_SGST">CGST + SGST</option>
+                  <option value="IGST">IGST</option>
+                  <option value="NONE">No Tax</option>
+                </select>
+              </div>
+
+              {taxType === "CGST_SGST" && (
+                <div className="mt-2 grid grid-cols-2 gap-2">
+                  <div>
+                    <div className="text-xs text-muted-foreground mb-1">
+                      CGST %
+                    </div>
+                    <Input
+                      type="number"
+                      min={0}
+                      step="0.01"
+                      value={cgstPercent.toString()}
+                      onChange={(e) =>
+                        setCgstPercent(Number(e.target.value) || 0)
+                      }
+                    />
+                  </div>
+                  <div>
+                    <div className="text-xs text-muted-foreground mb-1">
+                      SGST %
+                    </div>
+                    <Input
+                      type="number"
+                      min={0}
+                      step="0.01"
+                      value={sgstPercent.toString()}
+                      onChange={(e) =>
+                        setSgstPercent(Number(e.target.value) || 0)
+                      }
+                    />
+                  </div>
+                </div>
+              )}
+
+              {taxType === "IGST" && (
+                <div className="mt-2">
+                  <div className="text-xs text-muted-foreground mb-1">
+                    IGST %
+                  </div>
+                  <Input
+                    type="number"
+                    min={0}
+                    step="0.01"
+                    value={igstPercent.toString()}
+                    onChange={(e) =>
+                      setIgstPercent(Number(e.target.value) || 0)
+                    }
+                  />
+                </div>
+              )}
             </div>
           </div>
 
@@ -919,7 +1007,6 @@ export default function NewInvoicePage() {
                 rows={3}
                 value={notes}
                 onChange={(e) => setNotes(e.target.value)}
-                placeholder="Any internal notes for this invoice"
               />
             </div>
           </div>

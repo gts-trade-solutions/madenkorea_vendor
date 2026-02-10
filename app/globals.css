@@ -25,3 +25,55 @@ body {
     text-wrap: balance;
   }
 }
+
+
+@media print {
+  @page {
+    size: A4;
+    margin: 10mm;
+  }
+
+  html, body {
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
+  /* Hide app header/sidebar/topbars */
+  .print-hidden {
+    display: none !important;
+  }
+
+  /* Remove container max width so invoice uses full printable width */
+  .print-full {
+    max-width: none !important;
+    width: 100% !important;
+    padding: 0 !important;
+    margin: 0 !important;
+  }
+
+  /* Prevent table rows breaking weirdly */
+  tr, td, th {
+    page-break-inside: avoid;
+  }
+
+  /* No links printed */
+  a[href]:after { content: "" !important; }
+}
+
+@media print {
+  @page { size: A4; margin: 10mm; }
+  html, body { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  .print-hidden { display: none !important; }
+  .print-full { max-width: none !important; width: 100% !important; padding: 0 !important; margin: 0 !important; }
+  tr, td, th { page-break-inside: avoid; }
+  a[href]:after { content: "" !important; }
+}
+
+@media print {
+  .print-line-clamp-2 {
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+}
