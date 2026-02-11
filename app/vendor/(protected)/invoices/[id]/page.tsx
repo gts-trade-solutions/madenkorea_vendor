@@ -329,22 +329,33 @@ export default function InvoiceViewPage() {
   );
 
   const NotesAndSignature = () => (
-    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-      <div className="md:col-span-2 border border-slate-300 rounded-md p-3">
-        <div className="font-semibold text-sm mb-2">Notes</div>
-        <div className="text-xs whitespace-pre-line leading-5">
-          {notes || "-"}
-        </div>
-      </div>
+    <>
+    
+<div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-3 print:grid-cols-3">
+  {/* Notes: 2/3 */}
+  <div className="md:col-span-2 print:col-span-2">
+    <div className="text-xs font-semibold mb-1">Notes</div>
+    <div className="min-h-[90px] rounded-md border border-slate-300 p-3 text-xs whitespace-pre-line">
+      {notes || "—"}
+    </div>
+  </div>
 
-      <div className="border border-slate-300 rounded-md p-3 flex flex-col justify-between min-h-[180px]">
-        <div className="text-sm font-semibold">Authorized Seal & Signature</div>
-        <div className="border h-[110px] rounded-md my-3" />
-        <div className="text-xs text-right">
-          For <span className="font-medium">{sellerName}</span>
-        </div>
+  {/* Seal/Signature: 1/3 */}
+  <div className="md:col-span-1 print:col-span-1">
+    <div className="text-xs font-semibold mb-1">Authorized Signatory</div>
+    <div className="min-h-[90px] rounded-md border border-slate-300 p-3 text-xs flex flex-col justify-between">
+      <div className="text-[11px] text-slate-600">For {sellerName}</div>
+
+      {/* Optional seal image placeholder */}
+      {/* <div className="h-10 border border-dashed border-slate-300 rounded mt-2" /> */}
+
+      <div className="pt-6 text-right">
+        <div className="text-[11px] text-slate-600">Seal / Signature</div>
       </div>
     </div>
+  </div>
+</div>
+</>
   );
 
   return (
@@ -506,10 +517,37 @@ export default function InvoiceViewPage() {
           </div>
 
           {/* Notes + Signature */}
-          <div className="print-order-3 order-3">
-            <NotesAndSignature />
-          </div>
+         {/* Row 2: Notes + Authorized Seal/Signature (2 columns in one row) */}
+
+
         </div>
+{/* Row 2: Notes + Authorized Seal/Signature (equal height) */}
+<div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-3 print:grid-cols-3 items-stretch">
+  {/* Notes: 2/3 */}
+  <div className="md:col-span-2 print:col-span-2 flex flex-col">
+    <div className="text-xs font-semibold mb-1">Notes</div>
+
+    {/* ✅ h-full + flex-1 makes it match right side height */}
+    <div className="flex-1 min-h-[120px] rounded-md border border-slate-300 p-3 text-xs whitespace-pre-line">
+      {notes || "—"}
+    </div>
+  </div>
+
+  {/* Signatory: 1/3 */}
+  <div className="md:col-span-1 print:col-span-1 flex flex-col">
+    <div className="text-xs font-semibold mb-1">Authorized Signatory</div>
+
+    {/* ✅ same min-h + flex-1 */}
+    <div className="flex-1 min-h-[120px] rounded-md border border-slate-300 p-3 text-xs flex flex-col justify-between">
+      <div className="text-[11px] text-slate-600">For {sellerName}</div>
+
+      <div className="pt-6 text-right">
+        <div className="text-[11px] text-slate-600">Seal / Signature</div>
+      </div>
+    </div>
+  </div>
+</div>
+
       </div>
     </div>
   );

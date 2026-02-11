@@ -42,9 +42,9 @@ type ProductSuggestion = {
   id: string;
   name: string;
   brand_name: string | null;
+  hsn: string | null;
   mrp: number | null;
 };
-
 
 type InvoiceItem = {
   id: string;
@@ -73,6 +73,28 @@ type InvoiceAddress = {
   country: string;
   created_at?: string;
 };
+
+type ScannedUnit = {
+  unit_id: string;
+  unit_code: string;
+  product_id: string;
+  product_name: string;
+  brand_name: string;
+  hsn: string;
+  rate: number;
+};
+
+type InvoiceLine = {
+  product_id: string;
+  description: string;
+  brand: string;
+  hsn: string;
+  rate: number;
+  qty: number;
+  amount: number;
+};
+
+
 
 const DEFAULT_NOTES = `Reseller Disclaimer
 We are resellers and are not responsible for product usage or handling guidance. For detailed information on how to use the product safely and effectively, please contact the product manufacturer directly.
@@ -108,6 +130,34 @@ function createEmptyItem(): InvoiceItem {
 export default function NewInvoicePage() {
   const router = useRouter();
 
+  // ✅ Scan states (web-generated mode)
+  const [scanCode, setScanCode] = useState("");
+  const [scannedUnits, setScannedUnits] = useState<ScannedUnit[]>([]);
+
+type LineOverride = {
+  rate?: number;      // editable MRP
+  discount?: number;  // editable discount (flat amount per line)
+};
+
+const [lineOverrides, setLineOverrides] = useState<Record<string, LineOverride>>(
+  {},
+);
+
+const setLineRate = (productId: string, rate: number) => {
+  setLineOverrides((prev) => ({
+    ...prev,
+    [productId]: { ...(prev[productId] || {}), rate },
+  }));
+};
+
+const setLineDiscount = (productId: string, discount: number) => {
+  setLineOverrides((prev) => ({
+    ...prev,
+    [productId]: { ...(prev[productId] || {}), discount },
+  }));
+};
+
+
   const [taxType, setTaxType] = useState<TaxType>("CGST_SGST");
   const [cgstPercent, setCgstPercent] = useState<number>(9);
   const [sgstPercent, setSgstPercent] = useState<number>(9);
@@ -123,7 +173,7 @@ export default function NewInvoicePage() {
   const [addresses, setAddresses] = useState<InvoiceAddress[]>([]);
   const [selectedAddressId, setSelectedAddressId] = useState<string>("");
 
-  // ✅ Suggestions per-row
+  // ✅ Suggestions per-row (kept for safety; you can later remove entirely if you want scanning-only)
   const [productSuggestionsByItem, setProductSuggestionsByItem] = useState<
     Record<string, ProductSuggestion[]>
   >({});
@@ -148,6 +198,8 @@ export default function NewInvoicePage() {
   const [panNumber, setPanNumber] = useState<string>("");
 
   const [notes, setNotes] = useState<string>(DEFAULT_NOTES);
+
+  // ✅ Manual items (custom flow)
   const [items, setItems] = useState<InvoiceItem[]>([createEmptyItem()]);
 
   const selectedCompany = useMemo(
@@ -208,21 +260,15 @@ export default function NewInvoicePage() {
     loadAddresses();
   }, []);
 
-  const sellerSupportEmail = selectedCompany?.email || SUPPORT_EMAIL_FALLBACK;
-
-  // --- Item operations ---
+  // ✅ Manual items operations (custom flow)
   const updateItem = (id: string, patch: Partial<InvoiceItem>) => {
-    setItems((prev) =>
-      prev.map((it) => (it.id === id ? { ...it, ...patch } : it)),
-    );
+    setItems((prev) => prev.map((it) => (it.id === id ? { ...it, ...patch } : it)));
   };
 
   const addItem = () => setItems((prev) => [...prev, createEmptyItem()]);
 
   const removeItem = (id: string) => {
-    setItems((prev) =>
-      prev.length <= 1 ? prev : prev.filter((it) => it.id !== id),
-    );
+    setItems((prev) => (prev.length <= 1 ? prev : prev.filter((it) => it.id !== id)));
   };
 
   // --- Address selection -> prefill existing fields ---
@@ -244,8 +290,184 @@ export default function NewInvoicePage() {
     setBillingAddress(fullAddress);
   };
 
-  // --- Totals calculation (MRP only) ---
+  // ✅ Web-generated: scan unit_code, fetch unit + product + brand + hsn + rate
+  async function addUnitByCode(unitCodeRaw: string) {
+    const unitCode = unitCodeRaw.trim();
+    if (!unitCode) return;
+
+    // prevent duplicates in UI
+    if (scannedUnits.some((u) => u.unit_code === unitCode)) {
+      return;
+    }
+
+    // 1) fetch unit by unit_code
+    const { data: unit, error: unitErr } = await supabase
+      .from("inventory_units")
+      .select("id, unit_code, status, product_id")
+      .eq("unit_code", unitCode)
+      .maybeSingle();
+
+    if (unitErr) throw unitErr;
+    if (!unit) {
+      setError("Unit not found.");
+      return;
+    }
+
+    if ((unit.status || "").toUpperCase() !== "IN_STOCK") {
+      setError("Unit is not IN_STOCK (already sold/blocked).");
+      return;
+    }
+
+    // 2) fetch product + brand
+    const { data: product, error: prodErr } = await supabase
+      .from("products")
+      .select("id, name, hsn, compare_at_price, price, brands:brands(name)")
+      .eq("id", unit.product_id)
+      .maybeSingle();
+
+    if (prodErr) throw prodErr;
+    if (!product) {
+      setError("Product not found for this unit.");
+      return;
+    }
+
+    const brandName = (product as any)?.brands?.name || "";
+    const rate = Number(product.compare_at_price ?? product.price ?? 0);
+
+    const newScanned: ScannedUnit = {
+      unit_id: unit.id,
+      unit_code: unit.unit_code,
+      product_id: product.id,
+      product_name: product.name ?? "",
+      brand_name: brandName,
+      hsn: product.hsn ?? "",
+      rate,
+    };
+
+    setScannedUnits((prev) => [...prev, newScanned]);
+    setScanCode("");
+    setError(null);
+  }
+
+  function removeUnit(unitCode: string) {
+    setScannedUnits((prev) => prev.filter((u) => u.unit_code !== unitCode));
+  }
+
+  function removeProductLine(productId: string) {
+    setScannedUnits((prev) => prev.filter((u) => u.product_id !== productId));
+  }
+
+const scannedLines: InvoiceLine[] = useMemo(() => {
+  const map = new Map<string, InvoiceLine>();
+
+  for (const u of scannedUnits) {
+    const key = u.product_id;
+    const ov = lineOverrides[key] || {};
+    const effectiveRate =
+      Number.isFinite(Number(ov.rate)) ? Number(ov.rate) : u.rate;
+    const effectiveDiscount =
+      Number.isFinite(Number(ov.discount)) ? Number(ov.discount) : 0;
+
+    const existing = map.get(key);
+
+    if (!existing) {
+      const qty = 1;
+      const amount = qty * effectiveRate - effectiveDiscount;
+
+      map.set(key, {
+        product_id: u.product_id,
+        description: u.product_name,
+        brand: u.brand_name,
+        hsn: u.hsn,
+        rate: effectiveRate,
+        qty,
+        amount: Number(amount.toFixed(2)),
+      });
+    } else {
+      const qty = existing.qty + 1;
+      const amount = qty * effectiveRate - effectiveDiscount;
+
+      map.set(key, {
+        ...existing,
+        qty,
+        rate: effectiveRate, // keep override rate
+        amount: Number(amount.toFixed(2)),
+      });
+    }
+  }
+
+  // ensure discount overrides apply even if units already grouped
+  return Array.from(map.values()).map((l) => {
+    const d = Number(lineOverrides[l.product_id]?.discount ?? 0) || 0;
+    const a = l.qty * l.rate - d;
+    return { ...l, amount: Number(a.toFixed(2)) };
+  });
+}, [scannedUnits, lineOverrides]);
+
+
+  // --- Fetch suggestions per-row (web-generated mode only) ---
+  const fetchProductSuggestions = async (itemId: string, query: string) => {
+    if (isCustom) return;
+
+    const q = query.trim();
+    if (q.length < 2) {
+      setProductSuggestionsByItem((prev) => ({ ...prev, [itemId]: [] }));
+      return;
+    }
+
+    const { data, error } = await supabase
+      .from("products")
+      .select(
+        `
+          id,
+          name,
+          hsn,
+          compare_at_price,
+          brands:brands(name)
+        `,
+      )
+      .ilike("name", `%${q}%`)
+      .limit(10);
+
+    if (error) {
+      setProductSuggestionsByItem((prev) => ({ ...prev, [itemId]: [] }));
+      return;
+    }
+
+    const mapped: ProductSuggestion[] = (data || []).map((p: any) => ({
+      id: p.id,
+      name: p.name,
+      brand_name: p.brands?.name ?? null,
+      hsn: p.hsn ?? null,
+      mrp: p.compare_at_price == null ? null : Number(p.compare_at_price),
+    }));
+
+    setProductSuggestionsByItem((prev) => ({ ...prev, [itemId]: mapped }));
+  };
+
+  // --- Totals calculation ---
   const { subtotal, discountTotal, taxableAmount } = useMemo(() => {
+    // Custom uses manual items, Web-generated uses scannedLines
+if (!isCustom) {
+  let sub = 0;
+  let disc = 0;
+
+  for (const line of scannedLines) {
+    sub += line.qty * line.rate;
+    const d = Number(lineOverrides[line.product_id]?.discount ?? 0) || 0;
+    disc += d;
+  }
+
+  const taxable = sub - disc;
+
+  return {
+    subtotal: Number(sub.toFixed(2)),
+    discountTotal: Number(disc.toFixed(2)),
+    taxableAmount: Number(taxable.toFixed(2)),
+  };
+}
+
+
     let sub = 0;
     let disc = 0;
 
@@ -262,103 +484,69 @@ export default function NewInvoicePage() {
       discountTotal: Number(disc.toFixed(2)),
       taxableAmount: Number(taxable.toFixed(2)),
     };
-  }, [items]);
+  }, [items, isCustom, scannedLines]);
 
   // --- Tax calculation ---
-  const { cgstAmount, sgstAmount, igstAmount, taxTotal, grandTotal } =
-    useMemo(() => {
-      const taxable = taxableAmount;
+  const { cgstAmount, sgstAmount, igstAmount, taxTotal, grandTotal } = useMemo(() => {
+    const taxable = taxableAmount;
 
-      const cgst = taxType === "CGST_SGST" ? (taxable * cgstPercent) / 100 : 0;
-      const sgst = taxType === "CGST_SGST" ? (taxable * sgstPercent) / 100 : 0;
-      const igst = taxType === "IGST" ? (taxable * igstPercent) / 100 : 0;
+    const cgst = taxType === "CGST_SGST" ? (taxable * cgstPercent) / 100 : 0;
+    const sgst = taxType === "CGST_SGST" ? (taxable * sgstPercent) / 100 : 0;
+    const igst = taxType === "IGST" ? (taxable * igstPercent) / 100 : 0;
 
-      const tax = cgst + sgst + igst;
-      const grand = taxable + tax;
+    const tax = cgst + sgst + igst;
+    const grand = taxable + tax;
 
-      return {
-        cgstAmount: Number(cgst.toFixed(2)),
-        sgstAmount: Number(sgst.toFixed(2)),
-        igstAmount: Number(igst.toFixed(2)),
-        taxTotal: Number(tax.toFixed(2)),
-        grandTotal: Number(grand.toFixed(2)),
-      };
-    }, [taxableAmount, taxType, cgstPercent, sgstPercent, igstPercent]);
+    return {
+      cgstAmount: Number(cgst.toFixed(2)),
+      sgstAmount: Number(sgst.toFixed(2)),
+      igstAmount: Number(igst.toFixed(2)),
+      taxTotal: Number(tax.toFixed(2)),
+      grandTotal: Number(grand.toFixed(2)),
+    };
+  }, [taxableAmount, taxType, cgstPercent, sgstPercent, igstPercent]);
 
-  // --- Fetch suggestions per-row (web-generated mode only) ---
-  const fetchProductSuggestions = async (itemId: string, query: string) => {
-    if (isCustom) return;
-
-    const q = query.trim();
-    if (q.length < 2) {
-      setProductSuggestionsByItem((prev) => ({ ...prev, [itemId]: [] }));
-      return;
-    }
-
-const { data, error } = await supabase
-  .from("products")
-  .select(
-    `
-      id,
-      name,
-      brand_id,
-      compare_at_price,
-      brands:brands(name)
-    `,
-  )
-  .ilike("name", `%${q}%`)
-  .limit(10);
+const customerPayload = () => ({
+  name: customerName.trim(),
+  phone: phone.trim(),
+  email: email.trim() || null,
+  gstin: gstNumber.trim() || null,
+  billing_address: billingAddress.trim(),
+});
 
 
-    if (error) {
-      setProductSuggestionsByItem((prev) => ({ ...prev, [itemId]: [] }));
-      return;
-    }
-
-const mapped: ProductSuggestion[] = (data || []).map((p: any) => ({
-  id: p.id,
-  name: p.name,
-  brand_name: p.brands?.name ?? null,
-  mrp: p.compare_at_price == null ? null : Number(p.compare_at_price),
-}));
-
-
-    setProductSuggestionsByItem((prev) => ({ ...prev, [itemId]: mapped }));
-  };
-
-  // --- Submit (invoice_number removed; DB should auto-generate) ---
+  // --- Submit ---
   const handleSave = async () => {
     setError(null);
     setSuccessMessage(null);
 
     if (!companyId) return setError("Please select the invoice company.");
     if (!customerName.trim()) return setError("Please enter customer name.");
-    if (!billingAddress.trim())
-      return setError("Please enter billing address.");
+    if (!billingAddress.trim()) return setError("Please enter billing address.");
     if (!phone.trim()) return setError("Please enter customer mobile number.");
-    if (items.every((it) => !it.description.trim()))
-      return setError("Please enter at least one line item description.");
 
+    // ✅ Custom mode validation
+    if (isCustom) {
+      if (items.every((it) => !it.description.trim()))
+        return setError("Please enter at least one line item description.");
+    }
+
+    // ✅ Web-generated validation: require at least one scanned unit
     if (!isCustom) {
-      const invalid = items
-        .filter((it) => it.description.trim())
-        .some((it) => !it.product_id);
-      if (invalid) {
-        return setError(
-          "Web generated invoice: please select product names from suggestions for all items.",
-        );
+      if (scannedUnits.length === 0) {
+        return setError("Scan at least one unit to generate invoice items.");
       }
     }
 
     setSaving(true);
 
     try {
+      // 1) create invoice header
       const { data: invoiceData, error: invoiceError } = await supabase
         .from("invoices")
         .insert([
           {
             company_id: companyId,
-            // ✅ invoice_number not passed (auto generated in DB)
             invoice_date: invoiceDate || null,
             due_date: dueDate || null,
 
@@ -402,41 +590,124 @@ const mapped: ProductSuggestion[] = (data || []).map((p: any) => ({
 
       const invoiceId = invoiceData.id as string;
 
-      const itemsToInsert = items
-        .filter((it) => it.description.trim())
-        .map((it, index) => {
-          const lineSubtotal = it.quantity * it.mrp - it.discount;
+      // 2) create invoice_items
+      if (isCustom) {
+        const itemsToInsert = items
+          .filter((it) => it.description.trim())
+          .map((it, index) => {
+            const lineSubtotal = it.quantity * it.mrp - it.discount;
 
+            return {
+              invoice_id: invoiceId,
+              product_id: it.product_id ?? null,
+              brand: it.brand || null,
+              description: it.description,
+              hsn: it.hsn || null,
+              quantity: it.quantity,
+              unit_price: it.mrp, // ✅ store MRP into unit_price
+              discount: it.discount,
+              line_subtotal: Number(lineSubtotal.toFixed(2)),
+              line_total: Number(lineSubtotal.toFixed(2)),
+              position: index,
+            };
+          });
+
+        if (itemsToInsert.length > 0) {
+          const { error: itemsError } = await supabase.from("invoice_items").insert(itemsToInsert);
+          if (itemsError) throw new Error(itemsError.message || "Failed to create invoice items");
+        }
+      } else {
+        const linesToInsert = scannedLines.map((l, index) => {
+          const lineSubtotal = l.qty * l.rate; // no discount in scan mode
           return {
             invoice_id: invoiceId,
-            product_id: it.product_id ?? null,
-            brand: it.brand || null,
-            description: it.description,
-            hsn: it.hsn || null,
-            quantity: it.quantity,
-            unit_price: it.mrp, // ✅ keep DB column same, store MRP into unit_price
-            discount: it.discount,
+            product_id: l.product_id,
+            brand: l.brand || null,
+            description: l.description,
+            hsn: l.hsn || null,
+            quantity: l.qty,
+            unit_price: l.rate,
+            discount: 0,
             line_subtotal: Number(lineSubtotal.toFixed(2)),
             line_total: Number(lineSubtotal.toFixed(2)),
             position: index,
           };
         });
 
-      if (itemsToInsert.length > 0) {
-        const { error: itemsError } = await supabase
-          .from("invoice_items")
-          .insert(itemsToInsert);
-
-        if (itemsError) {
-          console.error(itemsError);
-          throw new Error(
-            itemsError.message || "Failed to create invoice items",
-          );
+        if (linesToInsert.length > 0) {
+          const { error: itemsError } = await supabase.from("invoice_items").insert(linesToInsert);
+          if (itemsError) throw new Error(itemsError.message || "Failed to create invoice items");
         }
+
+        // 3) insert invoice_units (unit-level)
+        const { error: iuErr } = await supabase.from("invoice_units").insert(
+          scannedUnits.map((u) => ({
+            invoice_id: invoiceId,
+            unit_id: u.unit_id,
+            unit_code: u.unit_code,
+            product_id: u.product_id,
+          })),
+        );
+        if (iuErr) throw new Error(iuErr.message || "Failed to link units to invoice");
+
+        // 4) update inventory_units -> SOLD
+        const unitIds = scannedUnits.map((u) => u.unit_id);
+
+        const { error: updErr } = await supabase
+          .from("inventory_units")
+          .update({
+            status: "SOLD",
+            sold_at: new Date().toISOString(),
+            sold_invoice_id: invoiceId,
+          })
+          .in("id", unitIds)
+          .eq("status", "IN_STOCK");
+
+        if (updErr) throw new Error(updErr.message || "Failed to update unit status");
       }
 
       setSuccessMessage("Invoice saved successfully.");
       router.push(`/vendor/invoices/${invoiceId}`);
+// ✅ Step 4: store customer against invoice + attach to sold units
+if (!isCustom) {
+  const cust = customerPayload();
+
+  // 1) create sold-customer record for this invoice
+  const { data: soldCustomer, error: soldCustErr } = await supabase
+    .from("invoice_sold_customers")
+    .insert([
+      {
+        invoice_id: invoiceId,
+        customer_name: cust.name,
+        phone: cust.phone,
+        email: cust.email,
+        gstin: cust.gstin,
+        billing_address: cust.billing_address,
+      },
+    ])
+    .select("id")
+    .single();
+
+  if (soldCustErr) throw new Error(soldCustErr.message || "Failed to store customer");
+
+  // 2) update units as SOLD + link customer
+  const unitIds = scannedUnits.map((u) => u.unit_id);
+
+  const { error: unitUpErr } = await supabase
+    .from("inventory_units")
+    .update({
+      status: "SOLD",
+      sold_invoice_id: invoiceId,
+      sold_at: new Date().toISOString(),
+      sold_customer_id: soldCustomer.id,      // ✅ store customer ref
+      sold_customer_address: cust.billing_address, // ✅ optional (if column exists)
+    })
+    .in("id", unitIds);
+
+  if (unitUpErr) throw new Error(unitUpErr.message || "Failed to update unit sold status");
+}
+
+
     } catch (err: any) {
       console.error(err);
       setError(err.message || "Something went wrong.");
@@ -464,11 +735,15 @@ const mapped: ProductSuggestion[] = (data || []).map((p: any) => ({
                   const next = e.target.checked;
                   setIsCustom(next);
 
-                  setItems((prev) =>
-                    prev.map((it) => ({ ...it, product_id: null })),
-                  );
+                  // reset suggestion state
                   setProductSuggestionsByItem({});
                   setActiveSuggestForItemId(null);
+
+                  // keep manual items intact, but clear product_id if switching modes
+                  setItems((prev) => prev.map((it) => ({ ...it, product_id: null })));
+
+                  // switching to custom: keep scanned units but they won't be used
+                  // switching to web-generated: keep scanned units; user can continue scanning
                 }}
                 className="h-4 w-4"
               />
@@ -480,7 +755,7 @@ const mapped: ProductSuggestion[] = (data || []).map((p: any) => ({
             <div className="text-xs text-muted-foreground">
               {isCustom
                 ? "You can type any item name and MRP."
-                : "Type product name → select suggestion → Brand & HSN will auto-fill. You can edit MRP/Discount."}
+                : "Web-generated: Scan unit QR → items auto-fill (no manual typing)."}
             </div>
           </div>
 
@@ -530,8 +805,7 @@ const mapped: ProductSuggestion[] = (data || []).map((p: any) => ({
             </select>
 
             <p className="text-xs text-muted-foreground">
-              Select an address to auto-fill Customer Details and Billing
-              Address.
+              Select an address to auto-fill Customer Details and Billing Address.
             </p>
           </div>
         </CardContent>
@@ -541,9 +815,7 @@ const mapped: ProductSuggestion[] = (data || []).map((p: any) => ({
       <Card>
         <CardHeader>
           <CardTitle>Create Invoice</CardTitle>
-          <CardDescription>
-            Invoice number will be auto-generated when you save.
-          </CardDescription>
+          <CardDescription>Invoice number will be auto-generated when you save.</CardDescription>
         </CardHeader>
 
         <CardContent className="space-y-6">
@@ -580,36 +852,21 @@ const mapped: ProductSuggestion[] = (data || []).map((p: any) => ({
               </Select>
 
               <div className="mt-2 rounded-md border bg-muted/30 p-2 text-xs text-slate-700">
-                <div className="font-medium">
-                  Seller: {selectedCompany?.display_name || "-"}
-                </div>
-                <div>
-                  Support Email:{" "}
-                  {selectedCompany?.email || SUPPORT_EMAIL_FALLBACK}
-                </div>
+                <div className="font-medium">Seller: {selectedCompany?.display_name || "-"}</div>
+                <div>Support Email: {selectedCompany?.email || SUPPORT_EMAIL_FALLBACK}</div>
                 <div>GSTIN: {selectedCompany?.gst_number || "-"}</div>
-                <div className="whitespace-pre-line">
-                  Address: {selectedCompany?.address || "-"}
-                </div>
+                <div className="whitespace-pre-line">Address: {selectedCompany?.address || "-"}</div>
               </div>
             </div>
 
             <div className="space-y-1">
               <Label>Invoice Date</Label>
-              <Input
-                type="date"
-                value={invoiceDate}
-                onChange={(e) => setInvoiceDate(e.target.value)}
-              />
+              <Input type="date" value={invoiceDate} onChange={(e) => setInvoiceDate(e.target.value)} />
             </div>
 
             <div className="space-y-1">
               <Label>Due Date</Label>
-              <Input
-                type="date"
-                value={dueDate}
-                onChange={(e) => setDueDate(e.target.value)}
-              />
+              <Input type="date" value={dueDate} onChange={(e) => setDueDate(e.target.value)} />
             </div>
           </div>
 
@@ -619,43 +876,27 @@ const mapped: ProductSuggestion[] = (data || []).map((p: any) => ({
             <div className="grid gap-4 md:grid-cols-2">
               <div className="space-y-1">
                 <Label>Customer Name</Label>
-                <Input
-                  value={customerName}
-                  onChange={(e) => setCustomerName(e.target.value)}
-                />
+                <Input value={customerName} onChange={(e) => setCustomerName(e.target.value)} />
               </div>
 
               <div className="space-y-1">
                 <Label>Customer Email (optional)</Label>
-                <Input
-                  type="email"
-                  value={email}
-                  onChange={(e) => setEmail(e.target.value)}
-                />
+                <Input type="email" value={email} onChange={(e) => setEmail(e.target.value)} />
               </div>
 
               <div className="space-y-1">
                 <Label>Mobile Number</Label>
-                <Input
-                  value={phone}
-                  onChange={(e) => setPhone(e.target.value)}
-                />
+                <Input value={phone} onChange={(e) => setPhone(e.target.value)} />
               </div>
 
               <div className="space-y-1">
                 <Label>GST No (Customer)</Label>
-                <Input
-                  value={gstNumber}
-                  onChange={(e) => setGstNumber(e.target.value)}
-                />
+                <Input value={gstNumber} onChange={(e) => setGstNumber(e.target.value)} />
               </div>
 
               <div className="space-y-1">
                 <Label>PAN Number (Customer)</Label>
-                <Input
-                  value={panNumber}
-                  onChange={(e) => setPanNumber(e.target.value)}
-                />
+                <Input value={panNumber} onChange={(e) => setPanNumber(e.target.value)} />
               </div>
             </div>
 
@@ -669,18 +910,73 @@ const mapped: ProductSuggestion[] = (data || []).map((p: any) => ({
             </div>
           </div>
 
+          {/* ✅ Scan section only in web-generated mode */}
+          {!isCustom && (
+            <div className="border-t pt-4 space-y-3">
+              <h3 className="text-base font-semibold">Scan Units</h3>
+
+              <div className="flex gap-2 items-end">
+                <div className="flex-1">
+                  <label className="text-sm font-medium">Scan Unit QR / Unit Code</label>
+                  <input
+                    className="mt-1 w-full border rounded px-3 py-2"
+                    value={scanCode}
+                    onChange={(e) => setScanCode(e.target.value)}
+                    placeholder="Scan or paste unit_code and press Enter"
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") addUnitByCode(scanCode);
+                    }}
+                  />
+                </div>
+                <button
+                  type="button"
+                  className="border rounded px-4 py-2"
+                  onClick={() => addUnitByCode(scanCode)}
+                >
+                  Add
+                </button>
+              </div>
+
+              <div className="flex flex-wrap gap-2">
+                {scannedUnits.map((u) => (
+                  <span
+                    key={u.unit_code}
+                    className="text-xs border rounded px-2 py-1 flex items-center gap-2"
+                    title={`${u.product_name} • ${u.brand_name}`}
+                  >
+                    {u.unit_code}
+                    <button
+                      type="button"
+                      className="text-red-600"
+                      onClick={() => removeUnit(u.unit_code)}
+                      aria-label={`Remove ${u.unit_code}`}
+                    >
+                      ×
+                    </button>
+                  </span>
+                ))}
+              </div>
+
+              <p className="text-xs text-muted-foreground">
+                Scanning the same product units increases quantity automatically.
+              </p>
+            </div>
+          )}
+
           {/* Line items */}
           <div className="border-t pt-4">
             <div className="mb-2 flex items-center justify-between">
               <h3 className="text-base font-semibold">Invoice Items</h3>
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                onClick={addItem}
-              >
-                + Add Item
-              </Button>
+
+              {isCustom ? (
+                <Button type="button" variant="outline" size="sm" onClick={addItem}>
+                  + Add Item
+                </Button>
+              ) : (
+                <div className="text-xs text-muted-foreground">
+                  Items are generated from scanned units
+                </div>
+              )}
             </div>
 
             <div className="overflow-x-auto rounded-md border">
@@ -695,90 +991,72 @@ const mapped: ProductSuggestion[] = (data || []).map((p: any) => ({
                     <th className="px-2 py-2 text-right w-[120px]">MRP</th>
                     <th className="px-2 py-2 text-right w-[120px]">Discount</th>
                     <th className="px-2 py-2 text-right w-[140px]">Amount</th>
-                    <th className="px-2 py-2 text-center w-[90px] print:hidden">
-                      Actions
-                    </th>
+                    <th className="px-2 py-2 text-center w-[90px] print:hidden">Actions</th>
                   </tr>
                 </thead>
 
                 <tbody>
-                  {items.map((item, idx) => {
-                    const lineAmount = item.quantity * item.mrp - item.discount;
+                  {isCustom ? (
+                    items.map((item, idx) => {
+                      const lineAmount = item.quantity * item.mrp - item.discount;
+                      const brandLocked = !isCustom && !!item.product_id;
+                      const hsnLocked = !isCustom && !!item.product_id;
 
-                    const brandLocked = !isCustom && !!item.product_id;
-                    const hsnLocked = !isCustom && !!item.product_id;
+                      return (
+                        <tr key={item.id} className="border-t align-top">
+                          <td className="px-2 py-2">{idx + 1}</td>
 
-                    return (
-                      <tr key={item.id} className="border-t align-top">
-                        <td className="px-2 py-2">{idx + 1}</td>
+                          <td className="px-2 py-2">
+                            <Input
+                              value={item.brand}
+                              onChange={(e) => updateItem(item.id, { brand: e.target.value })}
+                              placeholder="Brand"
+                              disabled={brandLocked}
+                            />
+                          </td>
 
-                        <td className="px-2 py-2">
-                          <Input
-                            value={item.brand}
-                            onChange={(e) =>
-                              updateItem(item.id, { brand: e.target.value })
-                            }
-                            placeholder="Brand"
-                            disabled={brandLocked}
-                          />
-                        </td>
+                          <td className="px-2 py-2 relative">
+                            <Input
+                              value={item.description}
+                              onFocus={() => !isCustom && setActiveSuggestForItemId(item.id)}
+                              onBlur={() => {
+                                setTimeout(() => {
+                                  setActiveSuggestForItemId((prev) => (prev === item.id ? null : prev));
+                                  setProductSuggestionsByItem((prev) => ({ ...prev, [item.id]: [] }));
+                                }, 150);
+                              }}
+                              onChange={(e) => {
+                                const v = e.target.value;
 
-                        <td className="px-2 py-2 relative">
-                          <Input
-                            value={item.description}
-                            onFocus={() =>
-                              !isCustom && setActiveSuggestForItemId(item.id)
-                            }
-                            onBlur={() => {
-                              setTimeout(() => {
-                                setActiveSuggestForItemId((prev) =>
-                                  prev === item.id ? null : prev,
-                                );
-                                setProductSuggestionsByItem((prev) => ({
-                                  ...prev,
-                                  [item.id]: [],
-                                }));
-                              }, 150);
-                            }}
-                            onChange={(e) => {
-                              const v = e.target.value;
+                                if (isCustom) {
+                                  updateItem(item.id, { description: v });
+                                  return;
+                                }
 
-                              if (isCustom) {
-                                updateItem(item.id, { description: v });
-                                return;
-                              }
+                                updateItem(item.id, {
+                                  description: v,
+                                  product_id: null,
+                                  brand: "",
+                                  hsn: "",
+                                });
 
-                              updateItem(item.id, {
-                                description: v,
-                                product_id: null,
-                                brand: "", // ✅ clear until user selects
-                                hsn: "", // ✅ clear until user selects
-                              });
+                                setActiveSuggestForItemId(item.id);
+                                fetchProductSuggestions(item.id, v);
+                              }}
+                              placeholder={isCustom ? "Product name" : "Search website product..."}
+                            />
 
-                              setActiveSuggestForItemId(item.id);
-                              fetchProductSuggestions(item.id, v);
-                            }}
-                            placeholder={
-                              isCustom
-                                ? "Product name"
-                                : "Search website product..."
-                            }
-                          />
-
-                          {!isCustom &&
-                            activeSuggestForItemId === item.id &&
-                            (productSuggestionsByItem[item.id]?.length || 0) >
-                              0 && (
-                              <div className="absolute z-20 mt-1 w-full rounded-md border bg-white shadow-sm max-h-60 overflow-auto">
-                                {productSuggestionsByItem[item.id].map(
-                                  (p: any) => (
+                            {!isCustom &&
+                              activeSuggestForItemId === item.id &&
+                              (productSuggestionsByItem[item.id]?.length || 0) > 0 && (
+                                <div className="absolute z-20 mt-1 w-full rounded-md border bg-white shadow-sm max-h-60 overflow-auto">
+                                  {productSuggestionsByItem[item.id].map((p: any) => (
                                     <button
                                       key={p.id}
                                       type="button"
                                       className="w-full text-left px-3 py-2 hover:bg-muted flex items-center justify-between gap-3"
                                       onMouseDown={(ev) => ev.preventDefault()}
                                       onClick={() => {
-                                        // ✅ Auto-fill Brand + HSN + MRP on selection
                                         updateItem(item.id, {
                                           description: p.name,
                                           product_id: p.id,
@@ -787,10 +1065,7 @@ const mapped: ProductSuggestion[] = (data || []).map((p: any) => ({
                                           mrp: p.mrp ?? 0,
                                         });
 
-                                        setProductSuggestionsByItem((prev) => ({
-                                          ...prev,
-                                          [item.id]: [],
-                                        }));
+                                        setProductSuggestionsByItem((prev) => ({ ...prev, [item.id]: [] }));
                                         setActiveSuggestForItemId(null);
                                       }}
                                     >
@@ -799,90 +1074,134 @@ const mapped: ProductSuggestion[] = (data || []).map((p: any) => ({
                                         {p.mrp != null ? fmtINR(p.mrp) : ""}
                                       </span>
                                     </button>
-                                  ),
-                                )}
-                              </div>
+                                  ))}
+                                </div>
+                              )}
+
+                            {!isCustom && item.description.trim() && !item.product_id && (
+                              <div className="mt-1 text-xs text-amber-600">Select from suggestions</div>
                             )}
+                          </td>
 
-                          {!isCustom &&
-                            item.description.trim() &&
-                            !item.product_id && (
-                              <div className="mt-1 text-xs text-amber-600">
-                                Select from suggestions
-                              </div>
-                            )}
-                        </td>
+                          <td className="px-2 py-2">
+                            <Input
+                              value={item.hsn}
+                              onChange={(e) => updateItem(item.id, { hsn: e.target.value })}
+                              placeholder="HSN"
+                              disabled={hsnLocked}
+                            />
+                          </td>
 
+                          <td className="px-2 py-2">
+                            <Input
+                              type="number"
+                              min={0}
+                              value={item.quantity.toString()}
+                              onChange={(e) =>
+                                updateItem(item.id, { quantity: Number(e.target.value) || 0 })
+                              }
+                            />
+                          </td>
+
+                          <td className="px-2 py-2">
+                            <Input
+                              type="number"
+                              min={0}
+                              step="0.01"
+                              value={item.mrp.toString()}
+                              onChange={(e) => updateItem(item.id, { mrp: Number(e.target.value) || 0 })}
+                            />
+                          </td>
+
+                          <td className="px-2 py-2">
+                            <Input
+                              type="number"
+                              min={0}
+                              step="0.01"
+                              value={item.discount.toString()}
+                              onChange={(e) =>
+                                updateItem(item.id, { discount: Number(e.target.value) || 0 })
+                              }
+                            />
+                          </td>
+
+                          <td className="px-2 py-2 text-right font-medium">{fmtINR(lineAmount)}</td>
+
+                          <td className="px-2 py-2 text-center print:hidden">
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="sm"
+                              onClick={() => removeItem(item.id)}
+                              disabled={items.length <= 1}
+                            >
+                              Remove
+                            </Button>
+                          </td>
+                        </tr>
+                      );
+                    })
+                  ) : (
+                    scannedLines.map((l, idx) => (
+                      <tr key={l.product_id} className="border-t align-top">
+                        <td className="px-2 py-2">{idx + 1}</td>
                         <td className="px-2 py-2">
-                          <Input
-                            value={item.hsn}
-                            onChange={(e) =>
-                              updateItem(item.id, { hsn: e.target.value })
-                            }
-                            placeholder="HSN"
-                            disabled={hsnLocked}
-                          />
-                        </td>
+  <Input value={l.brand} disabled />
+</td>
 
-                        <td className="px-2 py-2">
-                          <Input
-                            type="number"
-                            min={0}
-                            value={item.quantity.toString()}
-                            onChange={(e) =>
-                              updateItem(item.id, {
-                                quantity: Number(e.target.value) || 0,
-                              })
-                            }
-                          />
-                        </td>
+<td className="px-2 py-2">
+  <Input value={l.description} disabled />
+</td>
 
-                        <td className="px-2 py-2">
-                          <Input
-                            type="number"
-                            min={0}
-                            step="0.01"
-                            value={item.mrp.toString()}
-                            onChange={(e) =>
-                              updateItem(item.id, {
-                                mrp: Number(e.target.value) || 0,
-                              })
-                            }
-                          />
-                        </td>
+<td className="px-2 py-2">
+  <Input value={l.hsn} disabled />
+</td>
 
-                        <td className="px-2 py-2">
-                          <Input
-                            type="number"
-                            min={0}
-                            step="0.01"
-                            value={item.discount.toString()}
-                            onChange={(e) =>
-                              updateItem(item.id, {
-                                discount: Number(e.target.value) || 0,
-                              })
-                            }
-                          />
-                        </td>
+<td className="px-2 py-2">
+  <Input value={String(l.qty)} disabled />
+</td>
 
-                        <td className="px-2 py-2 text-right font-medium">
-                          {fmtINR(lineAmount)}
-                        </td>
+{/* ✅ MRP editable */}
+<td className="px-2 py-2">
+  <Input
+    type="number"
+    min={0}
+    step="0.01"
+    value={String(l.rate)}
+    onChange={(e) => setLineRate(l.product_id, Number(e.target.value) || 0)}
+  />
+</td>
+
+{/* ✅ Discount editable */}
+<td className="px-2 py-2">
+  <Input
+    type="number"
+    min={0}
+    step="0.01"
+    value={String(Number(lineOverrides[l.product_id]?.discount ?? 0))}
+    onChange={(e) =>
+      setLineDiscount(l.product_id, Number(e.target.value) || 0)
+    }
+  />
+</td>
+
+<td className="px-2 py-2 text-right font-medium">
+  {fmtINR(l.qty * l.rate - (Number(lineOverrides[l.product_id]?.discount ?? 0) || 0))}
+</td>
 
                         <td className="px-2 py-2 text-center print:hidden">
                           <Button
                             type="button"
                             variant="ghost"
                             size="sm"
-                            onClick={() => removeItem(item.id)}
-                            disabled={items.length <= 1}
+                            onClick={() => removeProductLine(l.product_id)}
                           >
                             Remove
                           </Button>
                         </td>
                       </tr>
-                    );
-                  })}
+                    ))
+                  )}
                 </tbody>
               </table>
             </div>
@@ -950,31 +1269,23 @@ const mapped: ProductSuggestion[] = (data || []).map((p: any) => ({
               {taxType === "CGST_SGST" && (
                 <div className="mt-2 grid grid-cols-2 gap-2">
                   <div>
-                    <div className="text-xs text-muted-foreground mb-1">
-                      CGST %
-                    </div>
+                    <div className="text-xs text-muted-foreground mb-1">CGST %</div>
                     <Input
                       type="number"
                       min={0}
                       step="0.01"
                       value={cgstPercent.toString()}
-                      onChange={(e) =>
-                        setCgstPercent(Number(e.target.value) || 0)
-                      }
+                      onChange={(e) => setCgstPercent(Number(e.target.value) || 0)}
                     />
                   </div>
                   <div>
-                    <div className="text-xs text-muted-foreground mb-1">
-                      SGST %
-                    </div>
+                    <div className="text-xs text-muted-foreground mb-1">SGST %</div>
                     <Input
                       type="number"
                       min={0}
                       step="0.01"
                       value={sgstPercent.toString()}
-                      onChange={(e) =>
-                        setSgstPercent(Number(e.target.value) || 0)
-                      }
+                      onChange={(e) => setSgstPercent(Number(e.target.value) || 0)}
                     />
                   </div>
                 </div>
@@ -982,17 +1293,13 @@ const mapped: ProductSuggestion[] = (data || []).map((p: any) => ({
 
               {taxType === "IGST" && (
                 <div className="mt-2">
-                  <div className="text-xs text-muted-foreground mb-1">
-                    IGST %
-                  </div>
+                  <div className="text-xs text-muted-foreground mb-1">IGST %</div>
                   <Input
                     type="number"
                     min={0}
                     step="0.01"
                     value={igstPercent.toString()}
-                    onChange={(e) =>
-                      setIgstPercent(Number(e.target.value) || 0)
-                    }
+                    onChange={(e) => setIgstPercent(Number(e.target.value) || 0)}
                   />
                 </div>
               )}
@@ -1003,21 +1310,13 @@ const mapped: ProductSuggestion[] = (data || []).map((p: any) => ({
           <div className="border-t pt-4">
             <div className="space-y-1">
               <Label>Notes / Internal Reference</Label>
-              <Textarea
-                rows={3}
-                value={notes}
-                onChange={(e) => setNotes(e.target.value)}
-              />
+              <Textarea rows={3} value={notes} onChange={(e) => setNotes(e.target.value)} />
             </div>
           </div>
 
           {/* Actions */}
           <div className="flex items-center justify-end gap-3 border-t pt-4">
-            <Button
-              type="button"
-              variant="outline"
-              onClick={() => window.print()}
-            >
+            <Button type="button" variant="outline" onClick={() => window.print()}>
               Print (Current View)
             </Button>
 

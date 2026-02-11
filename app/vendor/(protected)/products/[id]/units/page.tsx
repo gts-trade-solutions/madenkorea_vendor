@@ -93,11 +93,13 @@ type UnitRow = {
   price?: number | null;
   sold_customer_name?: string | null;
   sold_customer_phone?: string | null;
+  sold_customer_id?: string | null;
   // ✅ verified lock
   is_verified?: boolean | null;
   verified_at?: string | null;
   demo_customer_name?: string | null;
   demo_customer_phone?: string | null;
+  demo_customer_id?: string | null;
   demo_at?: string | null;
 };
 
@@ -1035,6 +1037,15 @@ export default function ProductUnitsPage({
   );
 
   const [demoDialogOpen, setDemoDialogOpen] = useState(false);
+
+  // ---------------- Customer details view dialog ----------------
+  const [customerViewOpen, setCustomerViewOpen] = useState(false);
+  const [customerViewUnit, setCustomerViewUnit] = useState<UnitRow | null>(
+    null,
+  );
+  const [customerViewCustomer, setCustomerViewCustomer] =
+    useState<CustomerRow | null>(null);
+  const [customerViewLoading, setCustomerViewLoading] = useState(false);
   const [demoTargetUnit, setDemoTargetUnit] = useState<UnitRow | null>(null);
   const [demoAuthOk, setDemoAuthOk] = useState(false);
 
@@ -1166,9 +1177,6 @@ export default function ProductUnitsPage({
   const [statusOverridePassword, setStatusOverridePassword] = useState("");
   const [statusOverrideWorking, setStatusOverrideWorking] = useState(false);
 
-  // gate so SOLD action must be admin-authorized
-  const [soldAuthOk, setSoldAuthOk] = useState(false);
-
   function createEphemeralAuthClient() {
     return createClient(
       process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -1208,6 +1216,41 @@ export default function ProductUnitsPage({
     setCustPhone("");
     setCustEmail("");
     setCustAddress("");
+  };
+  const openCustomerDetails = async (u: UnitRow) => {
+    const soldCustomerId =
+      (u as any).sold_customer_id ?? u.sold_customer_id ?? null;
+    const demoCustomerId =
+      (u as any).demo_customer_id ?? u.demo_customer_id ?? null;
+    const customerId =
+      u.status === "SOLD"
+        ? soldCustomerId
+        : u.status === "DEMO"
+          ? demoCustomerId
+          : null;
+
+    setCustomerViewUnit(u);
+    setCustomerViewCustomer(null);
+    setCustomerViewOpen(true);
+
+    if (!customerId) return;
+
+    setCustomerViewLoading(true);
+    try {
+      const { data, error } = await supabase
+        .from("customers")
+        .select("id,name,phone,email,address")
+        .eq("id", customerId)
+        .maybeSingle();
+
+      if (error) {
+        toast.error(error.message || "Failed to load customer");
+        return;
+      }
+      if (data) setCustomerViewCustomer(data);
+    } finally {
+      setCustomerViewLoading(false);
+    }
   };
 
   const openStatusOverride = (u: UnitRow, next: InventoryStatus) => {
@@ -1433,7 +1476,7 @@ export default function ProductUnitsPage({
       const { data, error } = await supabase
         .from("inventory_units")
         .select(
-          "id,unit_code,manufacture_date,expiry_date,status,created_at,price,sold_customer_name,sold_customer_phone,is_verified,verified_at",
+          "id,unit_code,manufacture_date,expiry_date,status,created_at,price,sold_customer_id,sold_customer_name,sold_customer_phone,demo_customer_id,demo_customer_name,demo_customer_phone,demo_at,is_verified,verified_at",
         )
         .eq("vendor_id", vendor.id)
         .eq("product_id", productId)
@@ -1453,12 +1496,6 @@ export default function ProductUnitsPage({
 
   const saveDemoWithCustomer = async () => {
     if (!vendor?.id || !demoTargetUnit) return;
-
-    if (!demoAuthOk) {
-      toast.error("Admin authorization required to mark DEMO");
-      return;
-    }
-
     const name = custName.trim();
     const phone = custPhone.trim();
 
@@ -2063,8 +2100,13 @@ export default function ProductUnitsPage({
   }, [ready, vendor?.id, productId, productId]);
 
   // ---------------- Filters applied to query ----------------
-  function applyUnitFilters(q: any) {
-    if (statusFilter !== "ALL") q = q.eq("status", statusFilter);
+  function applyUnitFilters(
+    q: any,
+    opts: { includeStatus?: boolean } = { includeStatus: true },
+  ) {
+    if (opts.includeStatus !== false) {
+      if (statusFilter !== "ALL") q = q.eq("status", statusFilter);
+    }
 
     const s = search.trim();
     if (s) q = q.ilike("unit_code", `%${s}%`);
@@ -2233,6 +2275,83 @@ export default function ProductUnitsPage({
 
   const totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
 
+  // ✅ Overall counts across ALL matching units (not only current page)
+  const [countsAll, setCountsAll] = useState<Record<InventoryStatus, number>>({
+    IN_STOCK: 0,
+    INVOICED: 0,
+    DEMO: 0,
+    SOLD: 0,
+    RETURNED: 0,
+    OUT_OF_STOCK: 0,
+  });
+
+  const fetchCountsAll = async () => {
+    if (!vendor?.id) return;
+
+    // Build a base query with ALL filters except status filter, then count per status.
+    const mk = (status: InventoryStatus) => {
+      let q: any = supabase
+        .from("inventory_units")
+        .select("id", { count: "exact", head: true })
+        .eq("vendor_id", vendor.id)
+        .eq("product_id", productId)
+        .eq("status", status);
+      q = applyUnitFilters(q, { includeStatus: false });
+      return q;
+    };
+
+    try {
+      const statuses: InventoryStatus[] = [
+        "IN_STOCK",
+        "INVOICED",
+        "DEMO",
+        "SOLD",
+        "RETURNED",
+        "OUT_OF_STOCK",
+      ];
+
+      const results = await Promise.all(
+        statuses.map(async (s) => {
+          const { count, error } = await mk(s);
+          if (error) throw error;
+          return [s, count ?? 0] as const;
+        }),
+      );
+
+      const next: Record<InventoryStatus, number> = {
+        IN_STOCK: 0,
+        INVOICED: 0,
+        DEMO: 0,
+        SOLD: 0,
+        RETURNED: 0,
+        OUT_OF_STOCK: 0,
+      };
+
+      for (const [s, c] of results) next[s] = c;
+      setCountsAll(next);
+    } catch (e: any) {
+      console.error(e);
+      // don't spam: only toast once on failure
+      toast.error(e?.message || "Failed to compute overall counts");
+    }
+  };
+
+  useEffect(() => {
+    if (!ready || !vendor?.id) return;
+    // Header counts should represent the whole dataset (matching filters), not the current page.
+    // We intentionally ignore statusFilter inside fetchCountsAll.
+    fetchCountsAll();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    ready,
+    vendor?.id,
+    productId,
+    filtersVersion,
+    expiredFilter,
+    includeNoExpiry,
+    // statusFilter is intentionally excluded because counts ignore it.
+  ]);
+
   const countsThisPage = useMemo(() => {
     const out: Record<InventoryStatus, number> = {
       IN_STOCK: 0,
@@ -2400,21 +2519,91 @@ export default function ProductUnitsPage({
   }, [overrideDeleteOpen]);
 
   // ---------------- Status updates (single row list) ----------------
+  // ✅ Status changes should NOT require override auth (per requirement).
   const updateStatusDirect = async (u: UnitRow, next: InventoryStatus) => {
     if (!vendor?.id) return;
     if (u.status === next) return;
 
-    // 🔒 SOLD lock: cannot change without admin
-    if (u.status === "SOLD") {
-      toast.error(
-        "This unit is SOLD. Admin override required to change status.",
+    // ✅ SOLD/DEMO can be reverted without admin.
+    // If reverting to IN_STOCK, clear any customer pointers stored on the unit.
+    if (next === "IN_STOCK" && (u.status === "SOLD" || u.status === "DEMO")) {
+      setUpdatingId(u.id);
+
+      // optimistic
+      setUnits((prev) =>
+        prev.map((x) =>
+          x.id === u.id
+            ? {
+                ...x,
+                status: next,
+                sold_customer_id: null,
+                sold_customer_name: null,
+                sold_customer_phone: null,
+                demo_customer_id: null,
+                demo_customer_name: null,
+                demo_customer_phone: null,
+                demo_at: null,
+              }
+            : x,
+        ),
       );
-      openStatusOverride(u, next);
+
+      const { error } = await supabase
+        .from("inventory_units")
+        .update({
+          status: next,
+          sold_customer_id: null,
+          sold_customer_name: null,
+          sold_customer_phone: null,
+          demo_customer_id: null,
+          demo_customer_name: null,
+          demo_customer_phone: null,
+          demo_at: null,
+        })
+        .eq("id", u.id)
+        .eq("vendor_id", vendor.id);
+
+      if (error) {
+        setUnits((prev) =>
+          prev.map((x) => (x.id === u.id ? { ...x, status: u.status } : x)),
+        );
+        setUpdatingId(null);
+        toast.error(error.message || "Status update failed");
+        return;
+      }
+
+      toast.success("Reverted to IN_STOCK");
+      await fetchUnits();
+      setUpdatingId(null);
       return;
     }
 
-    // 🔒 Setting SOLD / RETURNED / DEMO requires admin
-    if (next === "SOLD" || next === "RETURNED" || next === "DEMO") {
+    // ✅ SOLD: no auth. Collect customer details, then mark SOLD.
+    if (next === "SOLD") {
+      setSoldTargetUnit(u);
+      resetSoldForm();
+
+      if (u.sold_customer_name) setCustName(u.sold_customer_name ?? "");
+      if (u.sold_customer_phone) setCustPhone(u.sold_customer_phone ?? "");
+
+      setSoldDialogOpen(true);
+      return;
+    }
+
+    // ✅ DEMO: no auth. Collect customer details, then mark DEMO.
+    if (next === "DEMO") {
+      setDemoTargetUnit(u);
+      resetSoldForm();
+
+      if (u.demo_customer_name) setCustName(u.demo_customer_name ?? "");
+      if (u.demo_customer_phone) setCustPhone(u.demo_customer_phone ?? "");
+
+      setDemoDialogOpen(true);
+      return;
+    }
+
+    // 🔒 Keep RETURNED protected (unchanged behavior)
+    if (next === "RETURNED") {
       openStatusOverride(u, next);
       return;
     }
@@ -2447,19 +2636,89 @@ export default function ProductUnitsPage({
   };
 
   // ---------------- Status updates (scanned unit) ----------------
+  // ✅ Status changes should NOT require override auth (per requirement).
   const updateScannedStatus = async (next: InventoryStatus) => {
     if (!vendor?.id || !scannedUnit) return;
     if (scannedUnit.status === next) return;
 
-    if (scannedUnit.status === "SOLD") {
-      toast.error(
-        "This unit is SOLD. Admin override required to change status.",
-      );
-      openStatusOverride(scannedUnit, next);
+    // ✅ Revert SOLD/DEMO to IN_STOCK without auth; clear stored pointers.
+    if (
+      next === "IN_STOCK" &&
+      (scannedUnit.status === "SOLD" || scannedUnit.status === "DEMO")
+    ) {
+      setScanLoading(true);
+      const prev = scannedUnit.status;
+      setScannedUnit({
+        ...scannedUnit,
+        status: next,
+        sold_customer_id: null,
+        sold_customer_name: null,
+        sold_customer_phone: null,
+        demo_customer_id: null,
+        demo_customer_name: null,
+        demo_customer_phone: null,
+        demo_at: null,
+      });
+
+      const { error } = await supabase
+        .from("inventory_units")
+        .update({
+          status: next,
+          sold_customer_id: null,
+          sold_customer_name: null,
+          sold_customer_phone: null,
+          demo_customer_id: null,
+          demo_customer_name: null,
+          demo_customer_phone: null,
+          demo_at: null,
+        })
+        .eq("id", scannedUnit.id)
+        .eq("vendor_id", vendor.id)
+        .eq("product_id", productId);
+
+      if (error) {
+        setScannedUnit({ ...scannedUnit, status: prev });
+        setScanLoading(false);
+        toast.error(error.message || "Failed to update status");
+        return;
+      }
+
+      toast.success("Reverted to IN_STOCK");
+      setScanLoading(false);
+      await fetchUnits();
       return;
     }
 
-    if (next === "SOLD" || next === "RETURNED" || next === "DEMO") {
+    // ✅ SOLD: no auth. Collect customer details, then mark SOLD.
+    if (next === "SOLD") {
+      setSoldTargetUnit(scannedUnit);
+      resetSoldForm();
+
+      if (scannedUnit.sold_customer_name)
+        setCustName(scannedUnit.sold_customer_name ?? "");
+      if (scannedUnit.sold_customer_phone)
+        setCustPhone(scannedUnit.sold_customer_phone ?? "");
+
+      setSoldDialogOpen(true);
+      return;
+    }
+
+    // ✅ DEMO: no auth. Collect customer details, then mark DEMO.
+    if (next === "DEMO") {
+      setDemoTargetUnit(scannedUnit);
+      resetSoldForm();
+
+      if (scannedUnit.demo_customer_name)
+        setCustName(scannedUnit.demo_customer_name ?? "");
+      if (scannedUnit.demo_customer_phone)
+        setCustPhone(scannedUnit.demo_customer_phone ?? "");
+
+      setDemoDialogOpen(true);
+      return;
+    }
+
+    // 🔒 Keep RETURNED protected (unchanged behavior)
+    if (next === "RETURNED") {
       openStatusOverride(scannedUnit, next);
       return;
     }
@@ -2499,7 +2758,7 @@ export default function ProductUnitsPage({
       const { data, error } = await supabase
         .from("inventory_units")
         .select(
-          "id,unit_code,manufacture_date,expiry_date,status,created_at,price,sold_customer_name,sold_customer_phone,is_verified,verified_at",
+          "id,unit_code,manufacture_date,expiry_date,status,created_at,price,sold_customer_id,sold_customer_name,sold_customer_phone,demo_customer_id,demo_customer_name,demo_customer_phone,demo_at,is_verified,verified_at",
         )
         .eq("vendor_id", vendor.id)
         .eq("product_id", productId)
@@ -2638,12 +2897,6 @@ export default function ProductUnitsPage({
   const saveSoldWithCustomer = async () => {
     if (!vendor?.id || !soldTargetUnit) return;
 
-    // ✅ REQUIRED: admin authorization for SOLD
-    if (!soldAuthOk) {
-      toast.error("Admin authorization required to mark SOLD");
-      return;
-    }
-
     const name = custName.trim();
     const phone = custPhone.trim();
 
@@ -2688,7 +2941,6 @@ export default function ProductUnitsPage({
       setSoldDialogOpen(false);
       setSoldTargetUnit(null);
       resetSoldForm();
-      setSoldAuthOk(false);
       await fetchUnits();
     } finally {
       setUpdatingId(null);
@@ -3406,16 +3658,16 @@ export default function ProductUnitsPage({
 
           <div className="grid grid-cols-2 md:grid-cols-6 gap-2 text-sm">
             <div>
-              In stock: <b>{countsThisPage.IN_STOCK}</b>
+              In stock: <b>{countsAll.IN_STOCK}</b>
             </div>
             <div>
-              Demo: <b>{countsThisPage.DEMO}</b>
+              Demo: <b>{countsAll.DEMO}</b>
             </div>
             <div>
-              Sold: <b>{countsThisPage.SOLD}</b>
+              Sold: <b>{countsAll.SOLD}</b>
             </div>
             <div>
-              Returned: <b>{countsThisPage.RETURNED}</b>
+              Returned: <b>{countsAll.RETURNED}</b>
             </div>
           </div>
 
@@ -3631,6 +3883,21 @@ export default function ProductUnitsPage({
                                   ? ` (${(u as any).demo_customer_phone})`
                                   : ""}
                               </span>
+                            ) : null}
+
+                            {(u.status === "SOLD" || u.status === "DEMO") &&
+                            ((u as any).sold_customer_id ||
+                              (u as any).demo_customer_id ||
+                              u.sold_customer_id ||
+                              u.demo_customer_id) ? (
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="h-6 px-2 text-xs"
+                                onClick={() => openCustomerDetails(u)}
+                              >
+                                View customer
+                              </Button>
                             ) : null}
 
                             <Select
@@ -4543,51 +4810,6 @@ export default function ProductUnitsPage({
 
                 setStatusOverrideWorking(true);
                 try {
-                  // If next is SOLD => open SOLD dialog (after override)
-                  if (statusOverrideNext === "SOLD") {
-                    setSoldAuthOk(true); // ✅ allow Save SOLD
-                    setStatusOverrideOpen(false);
-
-                    setSoldTargetUnit(statusOverrideUnit);
-                    resetSoldForm();
-
-                    if (statusOverrideUnit.sold_customer_name)
-                      setCustName(statusOverrideUnit.sold_customer_name ?? "");
-                    if (statusOverrideUnit.sold_customer_phone)
-                      setCustPhone(
-                        statusOverrideUnit.sold_customer_phone ?? "",
-                      );
-
-                    // Clear override inputs so next time must re-enter
-                    setStatusOverrideEmail("");
-                    setStatusOverridePassword("");
-
-                    setSoldDialogOpen(true);
-                    return;
-                  }
-                  if (statusOverrideNext === "DEMO") {
-                    setDemoAuthOk(true);
-                    setStatusOverrideOpen(false);
-
-                    setDemoTargetUnit(statusOverrideUnit);
-                    resetSoldForm();
-
-                    // optional: prefill from previous demo fields if you added them
-                    if ((statusOverrideUnit as any).demo_customer_name)
-                      setCustName(
-                        (statusOverrideUnit as any).demo_customer_name ?? "",
-                      );
-                    if ((statusOverrideUnit as any).demo_customer_phone)
-                      setCustPhone(
-                        (statusOverrideUnit as any).demo_customer_phone ?? "",
-                      );
-
-                    setStatusOverrideEmail("");
-                    setStatusOverridePassword("");
-
-                    setDemoDialogOpen(true);
-                    return;
-                  }
                   // Otherwise do status update via normal supabase client
                   const { error } = await supabase
                     .from("inventory_units")
@@ -4969,6 +5191,218 @@ export default function ProductUnitsPage({
         </DialogContent>
       </Dialog>
 
+      {/* DEMO Customer Dialog */}
+      <Dialog
+        open={demoDialogOpen}
+        onOpenChange={(v) => {
+          setDemoDialogOpen(v);
+          if (!v) {
+            setDemoTargetUnit(null);
+            resetSoldForm();
+          }
+        }}
+      >
+        <DialogContent className="sm:max-w-[540px]">
+          <DialogHeader>
+            <DialogTitle>Mark as DEMO</DialogTitle>
+            <DialogDescription>
+              Add customer details for the demo. Existing customers will appear
+              as suggestions.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-3">
+            <div className="text-sm text-muted-foreground">
+              Unit:{" "}
+              <b className="font-mono">{demoTargetUnit?.unit_code ?? "-"}</b>
+            </div>
+
+            <div className="relative">
+              <Input
+                value={custQuery}
+                onChange={(e) => setCustQuery(e.target.value)}
+                placeholder="Search customer by name / phone / email…"
+                className="bg-background"
+              />
+
+              {custLoading || custSuggestions.length > 0 ? (
+                <div className="absolute z-[300] mt-1 w-full rounded-md border bg-background shadow-lg">
+                  {custLoading ? (
+                    <div className="p-2 text-sm text-muted-foreground">
+                      Searching…
+                    </div>
+                  ) : custSuggestions.length === 0 ? null : (
+                    <div className="max-h-[220px] overflow-auto">
+                      {custSuggestions.map((c) => (
+                        <button
+                          key={c.id}
+                          type="button"
+                          className="w-full text-left px-3 py-2 hover:bg-muted"
+                          onClick={() => chooseSuggestion(c)}
+                        >
+                          <div className="text-sm font-medium">{c.name}</div>
+                          <div className="text-xs text-muted-foreground">
+                            {c.phone ?? "—"} • {c.email ?? "—"}
+                          </div>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              ) : null}
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div className="space-y-1">
+                <div className="text-xs text-muted-foreground">
+                  Customer name *
+                </div>
+                <Input
+                  value={custName}
+                  onChange={(e) => {
+                    setCustName(e.target.value);
+                    setSelectedCustomerId(null);
+                  }}
+                  placeholder="Customer name"
+                  className="bg-background"
+                />
+              </div>
+
+              <div className="space-y-1">
+                <div className="text-xs text-muted-foreground">Phone</div>
+                <Input
+                  value={custPhone}
+                  onChange={(e) => {
+                    setCustPhone(e.target.value);
+                    setSelectedCustomerId(null);
+                  }}
+                  placeholder="Phone"
+                  className="bg-background"
+                />
+              </div>
+
+              <div className="space-y-1 sm:col-span-2">
+                <div className="text-xs text-muted-foreground">Email</div>
+                <Input
+                  value={custEmail}
+                  onChange={(e) => {
+                    setCustEmail(e.target.value);
+                    setSelectedCustomerId(null);
+                  }}
+                  placeholder="Email"
+                  className="bg-background"
+                />
+              </div>
+
+              <div className="space-y-1 sm:col-span-2">
+                <div className="text-xs text-muted-foreground">Address</div>
+                <Input
+                  value={custAddress}
+                  onChange={(e) => {
+                    setCustAddress(e.target.value);
+                    setSelectedCustomerId(null);
+                  }}
+                  placeholder="Address"
+                  className="bg-background"
+                />
+              </div>
+            </div>
+          </div>
+
+          <DialogFooter className="gap-2">
+            <Button
+              variant="outline"
+              onClick={() => {
+                setDemoDialogOpen(false);
+                setDemoTargetUnit(null);
+                resetSoldForm();
+              }}
+            >
+              Cancel
+            </Button>
+
+            <Button
+              onClick={saveDemoWithCustomer}
+              disabled={!demoTargetUnit || updatingId === demoTargetUnit?.id}
+            >
+              {updatingId === demoTargetUnit?.id
+                ? "Saving…"
+                : "Save & Mark DEMO"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Customer Details View Dialog */}
+      <Dialog
+        open={customerViewOpen}
+        onOpenChange={(v) => {
+          setCustomerViewOpen(v);
+          if (!v) {
+            setCustomerViewUnit(null);
+            setCustomerViewCustomer(null);
+          }
+        }}
+      >
+        <DialogContent className="sm:max-w-[560px]">
+          <DialogHeader>
+            <DialogTitle>Customer Details</DialogTitle>
+            <DialogDescription>
+              {customerViewUnit ? (
+                <>
+                  Unit <b className="font-mono">{customerViewUnit.unit_code}</b>{" "}
+                  • Status <b>{customerViewUnit.status}</b>
+                </>
+              ) : (
+                "—"
+              )}
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-3">
+            {customerViewLoading ? (
+              <div className="text-sm text-muted-foreground">Loading…</div>
+            ) : customerViewCustomer ? (
+              <div className="rounded-md border p-3 space-y-2 text-sm">
+                <div>
+                  <div className="text-xs text-muted-foreground">Name</div>
+                  <div className="font-medium">{customerViewCustomer.name}</div>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <div className="text-xs text-muted-foreground">Phone</div>
+                    <div>{customerViewCustomer.phone ?? "—"}</div>
+                  </div>
+                  <div>
+                    <div className="text-xs text-muted-foreground">Email</div>
+                    <div>{customerViewCustomer.email ?? "—"}</div>
+                  </div>
+                </div>
+                <div>
+                  <div className="text-xs text-muted-foreground">Address</div>
+                  <div className="whitespace-pre-line">
+                    {customerViewCustomer.address ?? "—"}
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <div className="text-sm text-muted-foreground">
+                No customer linked for this unit.
+              </div>
+            )}
+          </div>
+
+          <DialogFooter className="gap-2">
+            <Button
+              variant="outline"
+              onClick={() => setCustomerViewOpen(false)}
+            >
+              Close
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       {/* SOLD Customer Dialog */}
       <Dialog
         open={soldDialogOpen}
@@ -4977,7 +5411,6 @@ export default function ProductUnitsPage({
           if (!v) {
             setSoldTargetUnit(null);
             resetSoldForm();
-            setSoldAuthOk(false);
           }
         }}
       >
@@ -5095,7 +5528,6 @@ export default function ProductUnitsPage({
                 setSoldDialogOpen(false);
                 setSoldTargetUnit(null);
                 resetSoldForm();
-                setSoldAuthOk(false);
               }}
             >
               Cancel
@@ -5104,7 +5536,6 @@ export default function ProductUnitsPage({
             <Button
               onClick={saveSoldWithCustomer}
               disabled={!soldTargetUnit || updatingId === soldTargetUnit?.id}
-              title={!soldAuthOk ? "Admin authorization required" : undefined}
             >
               {updatingId === soldTargetUnit?.id
                 ? "Saving…"

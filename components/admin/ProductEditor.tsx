@@ -9,7 +9,6 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
-import { toast } from "sonner";
 import { Plus, Trash2, Upload } from "lucide-react";
 
 /* ──────────────────────────────────────────────────────────────
@@ -18,8 +17,76 @@ import { Plus, Trash2, Upload } from "lucide-react";
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
   process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
-  { auth: { persistSession: true, autoRefreshToken: true } }
+  { auth: { persistSession: true, autoRefreshToken: true } },
 );
+
+/* ──────────────────────────────────────────────────────────────
+   Local Toast (custom, no dependency)
+   ────────────────────────────────────────────────────────────── */
+type ToastType = "success" | "error" | "info" | "warning";
+type ToastMsg = {
+  id: string;
+  type: ToastType;
+  title: string;
+  description?: string;
+};
+function ToastStack({
+  toasts,
+  onClose,
+}: {
+  toasts: ToastMsg[];
+  onClose: (id: string) => void;
+}) {
+  return (
+    <div className="fixed top-4 right-4 z-[9999] space-y-2 w-[360px] max-w-[90vw]">
+      {toasts.map((t) => {
+        const border =
+          t.type === "success"
+            ? "border-green-500"
+            : t.type === "error"
+              ? "border-red-500"
+              : t.type === "warning"
+                ? "border-amber-500"
+                : "border-slate-300";
+
+        const bg =
+          t.type === "success"
+            ? "bg-green-50"
+            : t.type === "error"
+              ? "bg-red-50"
+              : t.type === "warning"
+                ? "bg-amber-50"
+                : "bg-white";
+
+        return (
+          <div
+            key={t.id}
+            className={`rounded-md border ${border} ${bg} shadow-md p-3`}
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <div className="font-semibold text-sm">{t.title}</div>
+                {t.description ? (
+                  <div className="text-xs text-slate-700 mt-1 whitespace-pre-line">
+                    {t.description}
+                  </div>
+                ) : null}
+              </div>
+              <button
+                type="button"
+                className="text-slate-600 hover:text-slate-900 text-sm"
+                onClick={() => onClose(t.id)}
+                aria-label="Close toast"
+              >
+                ✕
+              </button>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
 
 /* ──────────────────────────────────────────────────────────────
    Helpers
@@ -53,7 +120,9 @@ function safeKeyPart(s: string) {
 }
 function parseBool(v: any) {
   if (typeof v === "boolean") return v;
-  const s = String(v ?? "").trim().toLowerCase();
+  const s = String(v ?? "")
+    .trim()
+    .toLowerCase();
   return ["1", "true", "yes", "y"].includes(s);
 }
 
@@ -85,13 +154,16 @@ type ProductModel = {
   brand_id: string | "";
   category_id: string | "";
 
+  // ✅ NEW
+  hsn: string;
+
   price: number | null;
   currency: string;
 
   short_description: string;
   description: string;
 
-  // inventory + expiry (NEW)
+  // inventory + expiry
   track_inventory: boolean;
   stock_qty: number;
   expiry_date: string; // YYYY-MM-DD or ""
@@ -141,6 +213,18 @@ export function ProductEditor({
 }) {
   const router = useRouter();
 
+  // ✅ local toast state
+  const [toasts, setToasts] = useState<ToastMsg[]>([]);
+  const pushToast = (t: Omit<ToastMsg, "id">, ms = 3000) => {
+    const id = crypto.randomUUID();
+    setToasts((prev) => [...prev, { ...t, id }]);
+    window.setTimeout(() => {
+      setToasts((prev) => prev.filter((x) => x.id !== id));
+    }, ms);
+  };
+  const closeToast = (id: string) =>
+    setToasts((prev) => prev.filter((x) => x.id !== id));
+
   const [vendor, setVendor] = useState<VendorInfo | null>(null);
   const [brands, setBrands] = useState<BrandRow[]>([]);
   const [categories, setCategories] = useState<CategoryRow[]>([]);
@@ -151,12 +235,15 @@ export function ProductEditor({
     name: "",
     brand_id: "",
     category_id: "",
+
+    // ✅ NEW default
+    hsn: "",
+
     price: null,
     currency: "INR",
     short_description: "",
     description: "",
 
-    // inventory + expiry defaults (NEW)
     track_inventory: true,
     stock_qty: 0,
     expiry_date: "",
@@ -209,7 +296,11 @@ export function ProductEditor({
 
       const { data: rpc, error: rpcErr } = await supabase.rpc("get_my_vendor");
       if (rpcErr) {
-        toast.error(rpcErr.message);
+        pushToast({
+          type: "error",
+          title: "Vendor error",
+          description: rpcErr.message,
+        });
         router.replace("/vendor");
         return;
       }
@@ -251,11 +342,15 @@ export function ProductEditor({
           .maybeSingle();
 
         if (perr) {
-          toast.error(perr.message);
+          pushToast({
+            type: "error",
+            title: "Load failed",
+            description: perr.message,
+          });
           return;
         }
         if (!prod) {
-          toast.error("Product not found");
+          pushToast({ type: "error", title: "Product not found" });
           router.replace("/vendor/products");
           return;
         }
@@ -275,15 +370,20 @@ export function ProductEditor({
           name: prod.name || "",
           brand_id: prod.brand_id || "",
           category_id: prod.category_id || "",
+
+          // ✅ NEW load
+          hsn: prod.hsn || "",
+
           price: prod.price ?? null,
           currency: prod.currency || "INR",
           short_description: prod.short_description || "",
           description: prod.description || "",
 
-          // inventory + expiry from DB (NEW)
           track_inventory: parseBool(prod.track_inventory ?? true),
           stock_qty: Number(prod.stock_qty ?? 0),
-          expiry_date: prod.expiry_date ? String(prod.expiry_date).slice(0, 10) : "",
+          expiry_date: prod.expiry_date
+            ? String(prod.expiry_date).slice(0, 10)
+            : "",
 
           is_published: parseBool(prod.is_published),
           compare_at_price: prod.compare_at_price ?? null,
@@ -331,10 +431,7 @@ export function ProductEditor({
       const nextSort = (m.images[m.images.length - 1]?.sort_order ?? -1) + 1;
       return {
         ...m,
-        images: [
-          ...m.images,
-          { alt: "", sort_order: Math.max(0, nextSort) },
-        ],
+        images: [...m.images, { alt: "", sort_order: Math.max(0, nextSort) }],
       };
     });
   };
@@ -355,13 +452,18 @@ export function ProductEditor({
 
   const onSave = async (closeAfter = false) => {
     if (!vendor) {
-      toast.error("Vendor not ready");
+      pushToast({ type: "error", title: "Vendor not ready" });
       return;
     }
     if (!canSave) {
-      toast.error("Please fill name, brand and category");
+      pushToast({
+        type: "error",
+        title: "Missing fields",
+        description: "Please fill name, brand and category",
+      });
       return;
     }
+
     setBusy(true);
 
     try {
@@ -382,6 +484,9 @@ export function ProductEditor({
         brand_id: model.brand_id || null,
         category_id: model.category_id || null,
 
+        // ✅ NEW save
+        hsn: model.hsn?.trim() || null,
+
         short_description: model.short_description || null,
         description: model.description || null,
 
@@ -393,7 +498,6 @@ export function ProductEditor({
         sale_ends_at: model.sale_ends_at || null,
         is_published: !!model.is_published,
 
-        // inventory + expiry (NEW)
         track_inventory: !!model.track_inventory,
         stock_qty: Math.max(0, Number(model.stock_qty || 0)),
         expiry_date: model.expiry_date ? model.expiry_date : null,
@@ -489,7 +593,11 @@ export function ProductEditor({
               cacheControl: "31536000",
               contentType: row.file.type || undefined,
             });
-          if (upErr && upErr.message?.includes("already exists") && !overwriteStorage) {
+          if (
+            upErr &&
+            upErr.message?.includes("already exists") &&
+            !overwriteStorage
+          ) {
             throw new Error(`Image already exists in storage: ${key}`);
           }
           storage_path = key;
@@ -526,7 +634,9 @@ export function ProductEditor({
       if (imgRows.length) {
         const { error: imgErr } = await supabase
           .from("product_images")
-          .upsert(imgRows, { onConflict: "product_id,storage_path" });
+          .upsert(imgRows, {
+            onConflict: "product_id,storage_path",
+          });
         if (imgErr) throw new Error(imgErr.message);
       }
 
@@ -545,12 +655,18 @@ export function ProductEditor({
       } else if (model.video_file) {
         const cleanVid = safeKeyPart(model.video_file.name);
         const key = `${safeSku}/video/${cleanVid}`;
-        const { error: vErr } = await supabase.storage.from(bucket).upload(key, model.video_file, {
-          upsert: overwriteStorage,
-          cacheControl: "31536000",
-          contentType: model.video_file.type || undefined,
-        });
-        if (vErr && vErr.message?.includes("already exists") && !overwriteStorage) {
+        const { error: vErr } = await supabase.storage
+          .from(bucket)
+          .upload(key, model.video_file, {
+            upsert: overwriteStorage,
+            cacheControl: "31536000",
+            contentType: model.video_file.type || undefined,
+          });
+        if (
+          vErr &&
+          vErr.message?.includes("already exists") &&
+          !overwriteStorage
+        ) {
           throw new Error(`Video already exists in storage: ${key}`);
         }
         nextVideoPath = key;
@@ -576,11 +692,19 @@ export function ProductEditor({
         if (heroErr) throw new Error(heroErr.message);
       }
 
-      toast.success(mode === "create" ? "Product created" : "Product saved");
+      pushToast({
+        type: "success",
+        title: mode === "create" ? "Product created" : "Product saved",
+      });
+
       if (closeAfter) router.push("/vendor/products");
       else if (mode === "create") router.push(`/vendor/products/${prodId}`);
     } catch (e: any) {
-      toast.error(e?.message || "Save failed");
+      pushToast({
+        type: "error",
+        title: "Save failed",
+        description: e?.message || "Save failed",
+      });
     } finally {
       setBusy(false);
     }
@@ -598,7 +722,7 @@ export function ProductEditor({
               .getPublicUrl(row.storage_path);
             out[idx] = data.publicUrl;
           }
-        })
+        }),
       );
       setPublicUrls(out);
     })();
@@ -607,12 +731,15 @@ export function ProductEditor({
   if (!vendor)
     return (
       <div className="container mx-auto py-16 text-muted-foreground">
+        <ToastStack toasts={toasts} onClose={closeToast} />
         Loading…
       </div>
     );
 
   return (
     <div className="container mx-auto py-6">
+      <ToastStack toasts={toasts} onClose={closeToast} />
+
       <div className="mb-4">
         <Button variant="ghost" onClick={() => router.push("/vendor/products")}>
           ← Back
@@ -621,7 +748,9 @@ export function ProductEditor({
 
       <Card>
         <CardHeader>
-          <CardTitle>{mode === "create" ? "Add Product" : "Edit Product"}</CardTitle>
+          <CardTitle>
+            {mode === "create" ? "Add Product" : "Edit Product"}
+          </CardTitle>
         </CardHeader>
 
         <CardContent className="space-y-8">
@@ -636,6 +765,7 @@ export function ProductEditor({
                 }
               />
             </div>
+
             <div>
               <Label>Slug (leave blank to auto-generate)</Label>
               <Input
@@ -645,6 +775,7 @@ export function ProductEditor({
                 }
               />
             </div>
+
             <div>
               <Label>SKU (leave blank to auto-generate)</Label>
               <Input
@@ -654,7 +785,20 @@ export function ProductEditor({
                 }
               />
             </div>
-            <div className="grid grid-cols-2 gap-4">
+
+            {/* ✅ NEW: HSN */}
+            <div>
+              <Label>HSN</Label>
+              <Input
+                value={model.hsn}
+                onChange={(e) =>
+                  setModel((m) => ({ ...m, hsn: e.target.value }))
+                }
+                placeholder="e.g. 33049990"
+              />
+            </div>
+
+            <div className="grid grid-cols-2 gap-4 md:col-span-2">
               <div>
                 <Label>Brand</Label>
                 <select
@@ -798,7 +942,7 @@ export function ProductEditor({
             </div>
           </section>
 
-          {/* Inventory + Expiry (NEW) */}
+          {/* Inventory + Expiry */}
           <section className="grid grid-cols-1 md:grid-cols-3 gap-4">
             <div className="flex items-center gap-3 border rounded-md px-3 py-2">
               <Switch
@@ -858,7 +1002,7 @@ export function ProductEditor({
                 <Switch
                   checked={(model as any)[key]}
                   onCheckedChange={(v) =>
-                    setModel((m) => ({ ...m, [key]: v } as any))
+                    setModel((m) => ({ ...m, [key]: v }) as any)
                   }
                 />
                 <span>{label}</span>
@@ -883,10 +1027,7 @@ export function ProductEditor({
                 rows={3}
                 value={model.meta_description}
                 onChange={(e) =>
-                  setModel((m) => ({
-                    ...m,
-                    meta_description: e.target.value,
-                  }))
+                  setModel((m) => ({ ...m, meta_description: e.target.value }))
                 }
               />
             </div>
@@ -948,10 +1089,7 @@ export function ProductEditor({
               <Input
                 value={model.key_benefits_text}
                 onChange={(e) =>
-                  setModel((m) => ({
-                    ...m,
-                    key_benefits_text: e.target.value,
-                  }))
+                  setModel((m) => ({ ...m, key_benefits_text: e.target.value }))
                 }
               />
             </div>
@@ -984,7 +1122,9 @@ export function ProductEditor({
                 onChange={(e) =>
                   setModel((m) => ({
                     ...m,
-                    net_weight_g: e.target.value ? Number(e.target.value) : null,
+                    net_weight_g: e.target.value
+                      ? Number(e.target.value)
+                      : null,
                   }))
                 }
               />
@@ -994,10 +1134,7 @@ export function ProductEditor({
               <Input
                 value={model.country_of_origin}
                 onChange={(e) =>
-                  setModel((m) => ({
-                    ...m,
-                    country_of_origin: e.target.value,
-                  }))
+                  setModel((m) => ({ ...m, country_of_origin: e.target.value }))
                 }
               />
             </div>
@@ -1029,9 +1166,7 @@ export function ProductEditor({
               {model.images.map((row, idx) => (
                 <div
                   key={idx}
-                  className={`rounded-lg border p-3 ${
-                    row.remove ? "opacity-60" : ""
-                  }`}
+                  className={`rounded-lg border p-3 ${row.remove ? "opacity-60" : ""}`}
                 >
                   <div className="flex items-center justify-between mb-2">
                     <div className="text-sm font-medium">Image #{idx + 1}</div>

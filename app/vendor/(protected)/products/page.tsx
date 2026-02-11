@@ -286,29 +286,38 @@ const findProductIdsByUnitSearch = async (term: string) => {
    * Units summary for products (current page only).
    * If your units table is huge, move this to an RPC/view with aggregates.
    */
-  const fetchUnitSummaryForProducts = async (productIds: string[]) => {
-    if (!vendor?.id) return;
+const fetchUnitSummaryForProducts = async (productIds: string[]) => {
+  if (!vendor?.id) return;
 
-    const missing = productIds.filter((id) => !unitSummary[id]);
-    if (missing.length === 0) return;
+  const missing = productIds.filter((id) => !unitSummary[id]);
+  if (missing.length === 0) return;
+
+  const next: Record<string, UnitSummary> = {};
+  for (const pid of missing) {
+    next[pid] = { total: 0, byStatus: {}, expiredCount: 0, expiringSoonCount: 0 };
+  }
+
+  const step = 1000; // page size
+  let from = 0;
+
+  while (true) {
+    const to = from + step - 1;
 
     const { data, error } = await supabase
       .from("inventory_units")
       .select("product_id,status,expiry_date")
       .eq("vendor_id", vendor.id)
-      .in("product_id", missing);
+      .in("product_id", missing)
+      .range(from, to);
 
     if (error) {
       console.warn("unit summary fetch error", error);
       return;
     }
 
-    const next: Record<string, UnitSummary> = {};
-    for (const pid of missing) {
-      next[pid] = { total: 0, byStatus: {}, expiredCount: 0, expiringSoonCount: 0 };
-    }
+    const rows = (data ?? []) as any[];
 
-    for (const row of (data ?? []) as any[]) {
+    for (const row of rows) {
       const pid = String(row.product_id);
       const st = String(row.status || "IN_STOCK");
       const exp = row.expiry_date ? String(row.expiry_date).slice(0, 10) : null;
@@ -326,8 +335,15 @@ const findProductIdsByUnitSearch = async (term: string) => {
       }
     }
 
-    setUnitSummary((prev) => ({ ...prev, ...next }));
-  };
+    // stop when this page returned fewer than step rows
+    if (rows.length < step) break;
+
+    from += step;
+  }
+
+  setUnitSummary((prev) => ({ ...prev, ...next }));
+};
+
 
   // ---------------- main fetch (server-side search/pagination) ----------------
   const fetchProducts = async (opts?: { resetPage?: boolean; clearSummary?: boolean }) => {
@@ -654,7 +670,7 @@ if (s) {
                     <TableHead>Brand</TableHead>
                     {/* <TableHead>MRP</TableHead> */}
                     <TableHead className="min-w-[340px]">Units Summary</TableHead>
-                    <TableHead className="min-w-[180px]">Published</TableHead>
+                    <TableHead className="min-w-[220px] text-center">Published</TableHead>
                     <TableHead>Updated</TableHead>
                     <TableHead className="text-right">Actions</TableHead>
                   </TableRow>
@@ -748,18 +764,23 @@ if (s) {
                             ) : null}
                           </TableCell>
 
-                          <TableCell className="whitespace-nowrap">
-                            <div className="flex items-center gap-2">
-                              <Switch
-                                checked={p.is_published}
-                                onCheckedChange={(v) => togglePublish(p.id, v)}
-                                aria-label="Publish / hide"
-                              />
-                              <Badge variant={p.is_published ? "default" : "secondary"}>
-                                {p.is_published ? "Published" : "Hidden"}
-                              </Badge>
-                            </div>
-                          </TableCell>
+                         <TableCell className="whitespace-nowrap">
+  <div className="flex items-center justify-center gap-3">
+    <Switch
+      className="shrink-0"
+      checked={p.is_published}
+      onCheckedChange={(v) => togglePublish(p.id, v)}
+      aria-label="Publish / hide"
+    />
+    <Badge
+      className="shrink-0"
+      variant={p.is_published ? "default" : "secondary"}
+    >
+      {p.is_published ? "Published" : "Hidden"}
+    </Badge>
+  </div>
+</TableCell>
+
 
                           <TableCell className="whitespace-nowrap text-sm">
                             {new Date(p.updated_at).toLocaleDateString("en-IN", {
